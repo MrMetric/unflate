@@ -64,8 +64,45 @@ def containers() -> None:
 			assert run(*flags, input=r.stdout).stdout == r.stdout, 'not a fixed point'
 
 
+def idat_framing() -> None:
+	"""The joined IDAT data is exactly one zlib stream; anything else is refused."""
+	rows = b''.join(b'\0' + bytes((x * 13 + y * 7 + c * 40) & 255 for x in range(16) for c in range(3)) for y in range(16))
+	z = zlib.compress(rows, 9)
+	ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', 16, 16, 8, 2, 0, 0, 0))
+
+	def png(idat: bytes) -> bytes:
+		return b'\x89PNG\r\n\x1a\n' + ihdr + chunk(b'IDAT', idat) + chunk(b'IEND', b'')
+
+	def zlib_header(cmf: int, flg: int) -> bytes:
+		flg &= 0xe0
+		return bytes([cmf, flg | (31 - (cmf * 256 + flg) % 31) % 31])
+
+	cases = {
+		# A complete stream followed by padding: libpng decodes it, so dropping
+		# the padding with the real Adler-32 produced an undecodable file.
+		'padding after the zlib stream': z + bytes(8),
+		'bytes between the final block and Adler-32': z[:-4] + b'\0' + z[-4:],
+		'wrong Adler-32': z[:-1] + bytes([z[-1] ^ 1]),
+		'bad header check': bytes([z[0], z[1] ^ 1]) + z[2:],
+		'preset dictionary': zlib_header(z[0], z[1] | 0x20) + z[2:],
+		'not deflate': zlib_header(0x77, z[1]) + z[2:],
+	}
+	with tempfile.TemporaryDirectory() as td:
+		path = Path(td) / 'input.png'
+		for name, idat in cases.items():
+			data = png(idat)
+			for flags in ([], ['--fast']):
+				r = run(*flags, input=data)
+				assert r.returncode == 1 and r.stdout == b'', f'IDAT with {name} accepted'
+				path.write_bytes(data)
+				r = run(*flags, str(path))
+				assert r.returncode == 1 and path.read_bytes() == data, f'IDAT with {name} rewritten in place'
+				assert sorted(p.name for p in Path(td).iterdir()) == ['input.png'], 'refusal left files behind'
+
+
 def main() -> None:
 	containers()
+	idat_framing()
 	failures = []
 	with tempfile.TemporaryDirectory() as td:
 		root = Path(td)

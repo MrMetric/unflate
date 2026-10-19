@@ -756,6 +756,62 @@ test "distance floor: built trees carry the configured codewords, inherited ones
 	_ = swapMinDistCodes(0);
 	const revoked = (try polishLengths(a, hazard)).?;
 	try std.testing.expectEqual(@as(usize, 1), countNonzero(revoked.dist));
+
+	// Trailing zero lengths (HDIST padding) do not change the code, so a
+	// re-padded input tree is still inherited; a moved codeword is not.
+	var d_padded_empty = [_]u8{ 0, 0 };
+	var d_empty = [_]u8{0};
+	var d_padded_lone = [_]u8{ 0, 0, 1, 0, 0 };
+	var d_lone_at_2 = [_]u8{ 0, 0, 1 };
+	var d_lone_at_1 = [_]u8{ 0, 1 };
+	var padded_empty = inherited;
+	padded_empty.dist_lengths = &d_padded_empty;
+	var empty = inherited;
+	empty.dist_lengths = &d_empty;
+	var padded_lone = inherited;
+	padded_lone.dist_lengths = &d_padded_lone;
+	var lone_at_2 = inherited;
+	lone_at_2.dist_lengths = &d_lone_at_2;
+	var lone_at_1 = inherited;
+	lone_at_1.dist_lengths = &d_lone_at_1;
+	const block = struct {
+		fn of(h: Huff) Block {
+			return .{ .is_last = true, .body = .{ .huff = h } };
+		}
+	}.of;
+	try std.testing.expect(satisfiesDistFloor(block(empty), block(padded_empty), 2));
+	try std.testing.expect(satisfiesDistFloor(block(padded_empty), block(empty), 2));
+	try std.testing.expect(satisfiesDistFloor(block(lone_at_2), block(padded_lone), 2));
+	try std.testing.expect(!satisfiesDistFloor(block(lone_at_1), block(padded_lone), 2));
+	try std.testing.expect(!satisfiesDistFloor(block(empty), block(lone_at_2), 1));
+}
+
+test "distance floor: a re-padded inherited empty tree is the floor-free answer" {
+	// Fuzz-minimized: one dynamic block of literals whose
+	// empty distance tree is sent with HDIST 2. Without reparsing, the
+	// searches keep the empty tree at HDIST 1, which is the input's own code
+	// and therefore inherited: the result must equal the floor-free one.
+	const input = [_]u8{
+		0x05, 0xc1, 0xd1, 0x09, 0x80, 0x40, 0x0c, 0x44, 0xc1, 0x56, 0x5e, 0x01,
+		0x62, 0x1f, 0x96, 0x71, 0x62, 0xce, 0xcb, 0xc7, 0x11, 0x70, 0x17, 0xd2,
+		0xbe, 0x30, 0xc9, 0x30, 0x30, 0xb9, 0x30, 0x30, 0x30, 0x30, 0x30, 0x4d,
+		0x3a, 0xd4, 0x3e, 0xf9, 0x01,
+	};
+	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const previous_floor = swapMinDistCodes(2);
+	defer _ = swapMinDistCodes(previous_floor);
+	for ([_]bool{ false, true }) |reparse_on| {
+		const previous_reparse = swapReparse(reparse_on);
+		defer _ = swapReparse(previous_reparse);
+		_ = swapMinDistCodes(0);
+		const free = try optimizeDeflateBytes(a, &input);
+		_ = swapMinDistCodes(2);
+		const floored = try optimizeDeflateBytes(a, &input);
+		try std.testing.expect(inflateEql(&input, floored));
+		try std.testing.expectEqualSlices(u8, free, floored);
+	}
 }
 
 fn countNonzero(lengths: []const u8) usize {
@@ -3793,18 +3849,21 @@ const ReparseContext = struct {
 
 /// Does `result` satisfy the distance-code floor `want` relative to the
 /// block it was optimized from? Stored and fixed blocks always do. A dynamic
-/// tree identical to the input's own is inherited, including when only its
-/// tokens or header are re-encoded: the floor never repairs a pre-existing
-/// hazard, it only stops us from creating one. Otherwise the tree is ours
-/// and must carry `want` codewords.
+/// tree whose code equals the input's own is inherited, including when only
+/// its tokens or header are re-encoded and whatever HDIST padding either one
+/// is sent with: the floor never repairs a pre-existing hazard, it only stops
+/// us from creating one. Otherwise the tree is ours and must carry `want`
+/// codewords.
 fn satisfiesDistFloor(result: Block, input: Block, want: u8) bool {
 	const h = switch (result.body) {
 		.stored => return true,
 		.huff => |h| h,
 	};
 	if (h.is_fixed) return true;
-	if (input.body == .huff and !input.body.huff.is_fixed and
-		std.mem.eql(u8, input.body.huff.dist_lengths, h.dist_lengths)) return true;
+	if (input.body == .huff and !input.body.huff.is_fixed) {
+		const kept = input.body.huff.dist_lengths;
+		if (std.mem.eql(u8, kept[0..trimLen(kept, 0)], h.dist_lengths[0..trimLen(h.dist_lengths, 0)])) return true;
+	}
 	var n: usize = 0;
 	for (h.dist_lengths) |l| {
 		if (l != 0) n += 1;
@@ -4620,7 +4679,7 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 /// Input-size capacity is reserved up front to avoid ArrayList growth-leak in
 /// the arena. This is a reservation, not a hard allocation bound; container
 /// byte guards independently enforce the delivered file-size contract.
-fn optimizeDeflateBytes(a: std.mem.Allocator, in: []const u8) deflasm.ParseError![]u8 {
+pub fn optimizeDeflateBytes(a: std.mem.Allocator, in: []const u8) deflasm.ParseError![]u8 {
 	var buf: std.ArrayList(u8) = .empty;
 	try buf.ensureTotalCapacity(a, in.len);
 	try optimizeDeflateFused(a, &buf, in);
@@ -4806,22 +4865,23 @@ fn concat3(a: std.mem.Allocator, x: []const u8, y: []const u8, z: []const u8) ![
 	return out;
 }
 
-/// Optimize a zlib stream, retaining its header and Adler-32 trailer.
-/// Reject invalid headers, trailing bytes, inflate errors and checksum
-/// mismatches. A content change in our own re-encoding is an optimizer
-/// bug and panics; callers may preserve malformed input chunks verbatim.
-fn optimizeZlibStream(a: std.mem.Allocator, zlib_data: []const u8) ![]u8 {
+/// Extract candidate DEFLATE bytes after validating the zlib header.
+/// optimizeZlibDeflate checks the stream extent and Adler-32.
+fn zlibDeflate(zlib_data: []const u8) error{Malformed}![]const u8 {
 	if (zlib_data.len < 6) return error.Malformed;
 	const cmf: u32 = zlib_data[0];
 	const flg: u32 = zlib_data[1];
 	if (cmf & 0x0F != 8 or cmf >> 4 > 7 or (cmf * 256 + flg) % 31 != 0 or
 		flg & 0x20 != 0) return error.Malformed;
-	const deflate = zlib_data[2 .. zlib_data.len - 4];
-	var adler: u32 = undefined;
-	if (!inflateAdler(deflate, &adler)) return error.Malformed;
-	if (adler != rdU32be(zlib_data, zlib_data.len - 4)) return error.Malformed;
-	// One fused parse+optimize pass (reports the consumed extent) instead of
-	// a probe parse followed by a second parse inside optimizeDeflateBytes.
+	return zlib_data[2 .. zlib_data.len - 4];
+}
+
+/// Optimize exactly one zlib stream and return its DEFLATE bytes.
+/// The fused parse/optimize pass checks the consumed extent before Adler-32
+/// validation. Zig 0.16's std.compress.flate can crash on truncated input,
+/// so it must only see streams our parser has read to the end.
+fn optimizeZlibDeflate(a: std.mem.Allocator, zlib_data: []const u8) deflasm.ParseError![]u8 {
+	const deflate = try zlibDeflate(zlib_data);
 	var buf: std.ArrayList(u8) = .empty;
 	try buf.ensureTotalCapacity(a, deflate.len);
 	var consumed: usize = undefined;
@@ -4829,7 +4889,17 @@ fn optimizeZlibStream(a: std.mem.Allocator, zlib_data: []const u8) ![]u8 {
 	// Trailing bytes between the final block and the adler: reject, never
 	// silently drop.
 	if (consumed != deflate.len) return error.Malformed;
-	const opt = buf.items;
+	var adler: u32 = undefined;
+	if (!inflateAdler(deflate, &adler)) return error.Malformed;
+	if (adler != rdU32be(zlib_data, zlib_data.len - 4)) return error.Malformed;
+	return buf.items;
+}
+
+/// Preserve the zlib header and trailer around optimized DEFLATE bytes.
+/// Malformed input returns an error; changed decoded output panics.
+fn optimizeZlibStream(a: std.mem.Allocator, zlib_data: []const u8) ![]u8 {
+	const opt = try optimizeZlibDeflate(a, zlib_data);
+	const deflate = zlib_data[2 .. zlib_data.len - 4];
 	if (!inflateEql(deflate, opt))
 		@panic("BUG: aux zlib roundtrip failure - decompressed content differs");
 	return concat3(a, zlib_data[0..2], opt, zlib_data[zlib_data.len - 4 ..]);
@@ -4978,6 +5048,7 @@ pub fn optimizePng(in: []const u8, out: []u8) i64 {
 	}
 	if (idat.items.len < 6) return ERR;
 
+	// IDAT must be exactly one zlib stream; refuse trailing data rather than discard it.
 	const zlib_header = idat.items[0..2];
 	const adler = idat.items[idat.items.len - 4 ..];
 	const deflate = idat.items[2 .. idat.items.len - 4];
@@ -4986,7 +5057,7 @@ pub fn optimizePng(in: []const u8, out: []u8) i64 {
 	// Scratch below serves auxiliary embedded streams.
 	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer scratch.deinit();
-	const opt_deflate = optimizeDeflateBytes(a, deflate) catch return ERR;
+	const opt_deflate = optimizeZlibDeflate(a, idat.items) catch return ERR;
 
 	// Roundtrip: optimized IDAT must decompress to the original content.
 	if (!inflateEql(deflate, opt_deflate)) return ERR;
@@ -5006,6 +5077,57 @@ pub fn optimizePng(in: []const u8, out: []u8) i64 {
 	// Never emit a larger file.
 	if (buf.items.len > in.len) return emit(out, in);
 	return emit(out, buf.items);
+}
+
+test "PNG: truncated zlib streams are refused or kept before std.compress.flate reads them" {
+	// Fuzz-minimized: std.compress.flate (Zig 0.16) fails an assertion on the
+	// first stream and overflows on the second, both truncated mid-token. As
+	// IDAT they must be refused; as zTXt kept verbatim.
+	const truncated = [_][]const u8{
+		&.{
+			0x78, 0xda, 0xbd, 0xd3, 0xc5, 0x42, 0x10, 0x48, 0x00, 0x00, 0xd0, 0x01,
+			0x24, 0xa4, 0x94, 0x6e, 0x44, 0x45, 0x94, 0xee, 0x0e, 0x09, 0x05, 0x25,
+			0x45, 0x51, 0x41, 0xba, 0xbb, 0xbb, 0x95, 0x06, 0x95, 0x52, 0x29, 0x51,
+			0x40, 0x09, 0x09, 0x30, 0x14, 0x69, 0x04, 0x94, 0xee, 0xee, 0xee, 0xee,
+			0xae, 0xbd, 0xcd, 0x65, 0xef, 0x73, 0x7b, 0x3f, 0xf0, 0x00, 0xff, 0x30,
+			0xff, 0x30, 0x30, 0x30, 0x30,
+		},
+		&.{
+			0x78, 0xda, 0xed, 0xda, 0x01, 0x66, 0xc6, 0x40, 0x10, 0x86, 0xe1, 0xf7,
+			0x37, 0x30, 0x30, 0x30,
+		},
+	};
+	// 1x1 grayscale; the IDAT stream is one stored block holding [0, 0].
+	const ihdr = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0 };
+	const idat = [_]u8{ 0x78, 0x01, 0x01, 0x02, 0x00, 0xfd, 0xff, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01 };
+	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	var out: [4096]u8 = undefined;
+	for ([_]bool{ true, false }) |reparse_on| {
+		const previous = swapReparse(reparse_on);
+		defer _ = swapReparse(previous);
+		for (truncated) |z| {
+			var bad: std.ArrayList(u8) = .empty;
+			try bad.appendSlice(a, &PNG_SIG);
+			try writePngChunk(a, &bad, "IHDR", &ihdr);
+			try writePngChunk(a, &bad, "IDAT", z);
+			try writePngChunk(a, &bad, "IEND", "");
+			try std.testing.expectEqual(ERR, optimizePng(bad.items, &out));
+
+			var ztxt: std.ArrayList(u8) = .empty;
+			try writePngChunk(a, &ztxt, "zTXt", try std.mem.concat(a, u8, &.{ "Comment\x00\x00", z }));
+			var aux: std.ArrayList(u8) = .empty;
+			try aux.appendSlice(a, &PNG_SIG);
+			try writePngChunk(a, &aux, "IHDR", &ihdr);
+			try aux.appendSlice(a, ztxt.items);
+			try writePngChunk(a, &aux, "IDAT", &idat);
+			try writePngChunk(a, &aux, "IEND", "");
+			const n = optimizePng(aux.items, &out);
+			try std.testing.expect(n >= 0 and n <= aux.items.len);
+			try std.testing.expect(std.mem.indexOf(u8, out[0..@intCast(n)], ztxt.items) != null);
+		}
+	}
 }
 
 fn emit(out: []u8, src: []const u8) i64 {
