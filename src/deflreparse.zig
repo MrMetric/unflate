@@ -104,7 +104,7 @@ const PrefixIndex = struct {
 		const rank = group.start + group.cursor;
 		const cap = if (raw_len > 3000) @min(group.cursor, 1024) else group.cursor;
 		var lower = rank - cap;
-		const window_start = i - @min(i, 32768);
+		const window_start = i - @min(i, common.WINDOW_SIZE);
 		const cut = lower > group.start and self.positions[lower - 1] >= window_start;
 		if (lower < rank and self.positions[lower] < window_start) lower = lowerPosition(self.positions, lower, rank, window_start);
 		group.cursor += 1;
@@ -119,7 +119,7 @@ pub fn candidatesWithHistory(a: A, raw: []const u8, prior: []const u8) !Edges {
 pub fn candidatesForProgram(a: A, program: ir.Program) !Edges {
 	const raw = program.raw();
 	const prior = program.prior();
-	ensure(prior.len <= 32768);
+	ensure(prior.len <= common.WINDOW_SIZE);
 	ensure(raw.len <= std.math.maxInt(u32) - prior.len);
 	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer scratch.deinit();
@@ -138,7 +138,7 @@ pub fn candidatesForProgram(a: A, program: ir.Program) !Edges {
 		const range = index.eligible(i, raw.len);
 		if (range.cut) cut += 1;
 		var best = [_]Edge{.{ .distance = 0, .length = 0 }} ** 30;
-		const limit = @min(@as(usize, 258), raw.len - pos);
+		const limit = @min(@as(usize, common.MAX_MATCH_LENGTH), raw.len - pos);
 		// Read only where a source can need it: old >= 8 implies limit > 8.
 		const head: u64 = if (limit >= 8) std.mem.readInt(u64, joined[i..][0..8], .little) else 0;
 		// Sources arrive nearest first, so the distance symbol only grows.
@@ -190,7 +190,7 @@ pub fn candidatesForProgram(a: A, program: ir.Program) !Edges {
 /// table lookup for every source's distance symbol, word-wise extension, and
 /// the class record's length carried to the next position as a lower bound.
 fn candidatesReference(a: A, raw: []const u8, prior: []const u8) !Edges {
-	ensure(prior.len <= 32768);
+	ensure(prior.len <= common.WINDOW_SIZE);
 	ensure(raw.len <= std.math.maxInt(u32) - prior.len);
 	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer scratch.deinit();
@@ -211,7 +211,7 @@ fn candidatesReference(a: A, raw: []const u8, prior: []const u8) !Edges {
 		const range = index.eligible(i, raw.len);
 		if (range.cut) cut += 1;
 		var best = [_]Edge{.{ .distance = 0, .length = 0 }} ** 30;
-		const limit = @min(@as(usize, 258), raw.len - pos);
+		const limit = @min(@as(usize, common.MAX_MATCH_LENGTH), raw.len - pos);
 		var j = range.rank;
 		while (j > range.lower) {
 			j -= 1;
@@ -248,7 +248,7 @@ test "class tracking and vector extension reproduce the reference matcher" {
 	const a = arena.allocator();
 	var prng = std.Random.DefaultPrng.init(0x6d61746368);
 	const random = prng.random();
-	const buf = try a.alloc(u8, 32768 + 12001);
+	const buf = try a.alloc(u8, common.WINDOW_SIZE + 12001);
 	for (0..40) |trial| {
 		// Small alphabets, periodic structure and long runs saturate the
 		// 1024-occurrence cap and every distance class; sparse mutations
@@ -257,7 +257,7 @@ test "class tracking and vector extension reproduce the reference matcher" {
 		const prior_len = switch (trial % 5) {
 			0 => 0,
 			1 => random.intRangeAtMost(usize, 1, 40),
-			2 => 32768,
+			2 => common.WINDOW_SIZE,
 			else => random.intRangeAtMost(usize, 0, 5000),
 		};
 		const data = buf[0 .. prior_len + n];
@@ -286,9 +286,9 @@ test "history matcher includes boundary-straddling prefixes and overlapping sour
 			for (0..raw.len) |pos| {
 				const i = prior.len + pos;
 				var expected = [_]Edge{.{ .distance = 0, .length = 0 }} ** 30;
-				for (1..@min(i, 32768) + 1) |distance| {
+				for (1..@min(i, common.WINDOW_SIZE) + 1) |distance| {
 					var n: usize = 0;
-					while (n < 258 and pos + n < raw.len and joined[i - distance + n] == joined[i + n]) n += 1;
+					while (n < common.MAX_MATCH_LENGTH and pos + n < raw.len and joined[i - distance + n] == joined[i + n]) n += 1;
 					const sym = common.distCodeTable[distance].code;
 					if (n >= 3 and n > expected[sym].length) expected[sym] = .{ .distance = @intCast(distance), .length = @intCast(n) };
 				}
@@ -306,16 +306,16 @@ test "history matcher reaches distance 32768 and drops it as the window advances
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
-	const prior = try a.alloc(u8, 32768);
+	const prior = try a.alloc(u8, common.WINDOW_SIZE);
 	@memset(prior, 0);
 	@memcpy(prior[0..4], "abca");
 	const got = try candidatesWithHistory(a, "abca", prior);
 	try std.testing.expectEqual(@as(usize, 1), got.offsets[1]);
-	try std.testing.expectEqualDeep(Edge{ .distance = 32768, .length = 4 }, got.items[0]);
+	try std.testing.expectEqualDeep(Edge{ .distance = common.WINDOW_SIZE, .length = 4 }, got.items[0]);
 	// At offset one the same source is too far away; the shifted source
 	// (prior[1]) is still exactly 32768 bytes behind and matches three bytes.
 	try std.testing.expectEqual(@as(usize, 2), got.offsets[2]);
-	try std.testing.expectEqualDeep(Edge{ .distance = 32768, .length = 3 }, got.items[1]);
+	try std.testing.expectEqualDeep(Edge{ .distance = common.WINDOW_SIZE, .length = 3 }, got.items[1]);
 	const expired = try candidatesWithHistory(a, "xabca", prior);
 	try std.testing.expectEqual(@as(usize, 0), expired.items.len);
 }
@@ -345,17 +345,19 @@ pub const Counts = struct {
 };
 pub fn counts(ts: []const Token, ll: []const u8) Counts {
 	var c: Counts = .{};
-	c.add(256, false);
+	c.add(common.EOB, false);
 	for (ts) |t| switch (t) {
 		.lit => |b| c.add(b, false),
 		.match => |m| {
-			const code = if (m.length == 258 and (ll.len <= 285 or ll[285] == 0)) 284 else common.lenCodeTable[m.length].code;
+			const code = if (m.length == common.MAX_MATCH_LENGTH and (ll.len <= 285 or ll[285] == 0)) 284 else common.lenCodeTable[m.length].code;
 			c.add(code, false);
 			c.add(common.distCodeTable[m.distance].code, true);
 		},
 	};
 	return c;
 }
+const KRAFT_FULL: u32 = 1 << 15; // Kraft sum in 2^-15 units
+
 fn kraft(lens: []const u8) u32 {
 	var sum: u32 = 0;
 	for (lens) |l| if (l != 0) {
@@ -374,7 +376,7 @@ pub fn mergeTree(prev: []const u8, freq: []const u32, order: []const u16, out: [
 		return;
 	}
 	// Stable ties follow Counter insertion order, not symbol order.
-	while (kraft(out) > 32768) {
+	while (kraft(out) > KRAFT_FULL) {
 		var selected: ?usize = null;
 		for (order) |sym| if (out[sym] < 15) {
 			if (selected == null or freq[sym] < freq[selected.?] or
@@ -383,8 +385,8 @@ pub fn mergeTree(prev: []const u8, freq: []const u32, order: []const u16, out: [
 		ensure(selected != null);
 		out[selected.?] += 1;
 	}
-	while (kraft(out) < 32768) {
-		const deficit = 32768 - kraft(out);
+	while (kraft(out) < KRAFT_FULL) {
+		const deficit = KRAFT_FULL - kraft(out);
 		var selected: ?usize = null;
 		for (order) |sym| if (out[sym] > 1 and (@as(u32, 1) << @intCast(15 - out[sym])) <= deficit) {
 			if (selected == null or freq[sym] > freq[selected.?] or
@@ -393,7 +395,7 @@ pub fn mergeTree(prev: []const u8, freq: []const u32, order: []const u16, out: [
 		ensure(selected != null);
 		out[selected.?] -= 1;
 	}
-	ensure(kraft(out) == 32768);
+	ensure(kraft(out) == KRAFT_FULL);
 }
 /// Matchless distance tree under the production floor (opt.min_dist_codes).
 pub fn emptyCl(a: A, ll: []const u8) !opt.EmptyDistCl {
@@ -402,7 +404,7 @@ pub fn emptyCl(a: A, ll: []const u8) !opt.EmptyDistCl {
 fn header(scratch: *std.heap.ArenaAllocator, ll: []const u8, d: []const u8) !i64 {
 	defer _ = scratch.reset(.retain_capacity);
 	const a = scratch.allocator();
-	const lt = trim(ll, 257);
+	const lt = trim(ll, common.EOB + 1);
 	const dt = trim(d, 1);
 	var any = false;
 	for (dt) |l| {
@@ -417,8 +419,8 @@ pub fn prices(a: A, h: deflasm.Huff, c: Counts, scale: f64, literal_bytes: [256]
 	const ll = ll_buf[0..if (h.is_fixed) @as(usize, 288) else 286];
 	const d = d_buf[0..if (h.is_fixed) @as(usize, 32) else 30];
 	if (h.is_fixed) {
-		for (0..288) |i| ll[i] = if (i < 144) 8 else if (i < 256) 9 else if (i < 280) 7 else 8;
-		@memset(d, 5);
+		@memcpy(ll, &common.fixed_ll_lengths);
+		@memcpy(d, &common.fixed_dist_lengths);
 	} else {
 		@memcpy(ll[0..h.ll_lengths.len], h.ll_lengths);
 		@memcpy(d[0..h.dist_lengths.len], h.dist_lengths);
@@ -435,7 +437,7 @@ pub fn prices(a: A, h: deflasm.Huff, c: Counts, scale: f64, literal_bytes: [256]
 	}
 	const base = try header(&scratch, ll, d);
 	for (0..286) |sym| {
-		if (sym == 256 or (sym < 256 and !literal_bytes[sym] and ll[sym] == 0)) {
+		if (sym == common.EOB or (sym < common.EOB and !literal_bytes[sym] and ll[sym] == 0)) {
 			p.ll[sym] = @floatFromInt(if (ll[sym] == 0) le else ll[sym]);
 			continue;
 		}
@@ -533,7 +535,7 @@ pub fn parse(a: A, edges: Edges, p: Prices) !Parse {
 			}
 		}
 	}
-	const predicted = costs[raw.len] + p.ll[256];
+	const predicted = costs[raw.len] + p.ll[common.EOB];
 	if (!std.math.isFinite(predicted)) return error.NonFiniteCost;
 	var ts: std.ArrayList(Token) = .empty;
 	var i = raw.len;
@@ -569,7 +571,7 @@ fn materializeOrdered(a: A, ts: []Token, prev: ?deflasm.Huff, is_last: bool, com
 		var d: [30]u8 = undefined;
 		mergeTree(h.ll_lengths, &c.ll, c.ll_order[0..c.nl], &ll);
 		var b = &block.body.huff;
-		b.ll_lengths = try a.dupe(u8, trim(&ll, 257));
+		b.ll_lengths = try a.dupe(u8, trim(&ll, common.EOB + 1));
 		if (c.nd != 0) {
 			mergeTree(h.dist_lengths, &c.dist, c.d_order[0..c.nd], &d);
 			opt.distFloor(&d);
@@ -596,7 +598,7 @@ test "match edges preserve nearest longest sources and overlapping copies" {
 		var expected = [_]Edge{.{ .distance = 0, .length = 0 }} ** 30;
 		for (1..i + 1) |distance| {
 			var length: usize = 0;
-			while (length < 258 and i + length < raw.len and raw[i - distance + length] == raw[i + length]) length += 1;
+			while (length < common.MAX_MATCH_LENGTH and i + length < raw.len and raw[i - distance + length] == raw[i + length]) length += 1;
 			const ds = common.distCodeTable[distance].code;
 			if (length >= 3 and length > expected[ds].length) expected[ds] = .{ .distance = @intCast(distance), .length = @intCast(length) };
 		}
@@ -626,7 +628,7 @@ test "large matcher keeps nearest 1024 prefix occurrences" {
 		try std.testing.expectEqual(expected, es.len);
 		for (es, 0..) |e, j| {
 			try std.testing.expectEqual(common.DIST_BASE[j], e.distance);
-			try std.testing.expectEqual(@min(258, raw.len - i), e.length);
+			try std.testing.expectEqual(@min(common.MAX_MATCH_LENGTH, raw.len - i), e.length);
 		}
 	}
 }
@@ -636,7 +638,7 @@ test "tree completion uses insertion order to break equal-frequency ties" {
 	var out: [4]u8 = undefined;
 	mergeTree(&prev, &freq, &.{ 2, 0, 3, 1 }, &out);
 	try std.testing.expectEqualDeep([_]u8{ 2, 3, 1, 3 }, out);
-	try std.testing.expectEqual(@as(u32, 32768), kraft(&out));
+	try std.testing.expectEqual(@as(u32, KRAFT_FULL), kraft(&out));
 }
 
 test "indexed sources keep the prefix cap and 32768-byte window independent" {
@@ -649,12 +651,12 @@ test "indexed sources keep the prefix cap and 32768-byte window independent" {
 	// 32768/37 < 1024: there are more old occurrences, but they must not
 	// count as a chain-cap cutoff after falling out of the window.
 	try std.testing.expectEqual(@as(usize, 0), got.cut_positions);
-	for ([_]usize{ 258, 3000, 32767, 32768, 32769, 39740, 39996 }) |pos| {
+	for ([_]usize{ common.MAX_MATCH_LENGTH, 3000, 32767, common.WINDOW_SIZE, 32769, 39740, 39996 }) |pos| {
 		var expected = [_]Edge{.{ .distance = 0, .length = 0 }} ** 30;
 		var visited: usize = 0;
-		for (1..@min(pos, 32768) + 1) |distance| {
+		for (1..@min(pos, common.WINDOW_SIZE) + 1) |distance| {
 			var n: usize = 0;
-			while (n < 258 and pos + n < raw.len and raw[pos - distance + n] == raw[pos + n]) n += 1;
+			while (n < common.MAX_MATCH_LENGTH and pos + n < raw.len and raw[pos - distance + n] == raw[pos + n]) n += 1;
 			if (n < 3) continue;
 			if (visited == 1024) break;
 			visited += 1;
@@ -761,7 +763,7 @@ fn parseReference(a: A, raw: []const u8, edges: Edges, p: Prices) !Parse {
 			}
 		}
 	}
-	const predicted = costs[raw.len] + p.ll[256];
+	const predicted = costs[raw.len] + p.ll[common.EOB];
 	if (!std.math.isFinite(predicted)) return error.NonFiniteCost;
 	var ts: std.ArrayList(Token) = .empty;
 	var i = raw.len;

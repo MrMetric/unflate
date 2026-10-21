@@ -43,7 +43,7 @@ pub const Program = struct {
 		for (block.body.huff.tokens) |t| switch (t) {
 			.lit => |b| { buffer[pos] = b; pos += 1; },
 			.match => |m| {
-				if (m.length < 3 or m.length > 258 or m.distance == 0 or m.distance > 32768 or
+				if (m.length < 3 or m.length > common.MAX_MATCH_LENGTH or m.distance == 0 or m.distance > common.WINDOW_SIZE or
 					m.distance > pos) return error.Malformed;
 				for (0..m.length) |_| {
 					buffer[pos] = buffer[pos - m.distance];
@@ -63,7 +63,7 @@ pub const Program = struct {
 		switch (t) {
 			.lit => |b| return p.raw()[start] == b,
 			.match => |m| {
-				if (m.length < 3 or m.length > 258 or m.distance == 0 or m.distance > 32768) return false;
+				if (m.length < 3 or m.length > common.MAX_MATCH_LENGTH or m.distance == 0 or m.distance > common.WINDOW_SIZE) return false;
 				const pos = p.history + start;
 				return m.distance <= pos and std.mem.eql(u8, p.bytes[pos..][0..m.length], p.bytes[pos - m.distance..][0..m.length]);
 			},
@@ -90,9 +90,10 @@ pub const Edge = struct { distance: u16, length: u16 };
 /// length classes 257..285. Length 258 is one semantic class regardless of
 /// its eventual spelling as 285 or 284+31. Literals remain available.
 pub const SymbolMask = u64;
+pub const LENGTH_MASK_SHIFT = 32;
 pub fn matchSymbols(length: u16, distance: u16) SymbolMask {
 	return (@as(SymbolMask, 1) << @intCast(common.distCodeTable[distance].code)) |
-		(@as(SymbolMask, 1) << @intCast(32 + common.lenCodeTable[length].code - 257));
+		(@as(SymbolMask, 1) << @intCast(LENGTH_MASK_SHIFT + common.lenCodeTable[length].code - common.FIRST_LENGTH_SYMBOL));
 }
 
 /// Each stored match represents lengths 3..length; literals are implicit.
@@ -158,10 +159,10 @@ test "interval equivalence includes history, position, overlap and exact coverag
 	try std.testing.expect(!p.accepts(p.raw().len, .{ .lit = 'x' }));
 	const historical = try Program.init(a, "abc", "abczz");
 	try std.testing.expect(historical.accepts(0, .{ .match = .{ .length = 3, .distance = 5 } }));
-	var window: [32768]u8 = @splat('z');
+	var window: [common.WINDOW_SIZE]u8 = @splat('z');
 	@memcpy(window[0..3], "abc");
 	const boundary = try Program.init(a, "abc", &window);
-	try std.testing.expect(boundary.accepts(0, .{ .match = .{ .length = 3, .distance = 32768 } }));
+	try std.testing.expect(boundary.accepts(0, .{ .match = .{ .length = 3, .distance = common.WINDOW_SIZE } }));
 	try std.testing.expect(!boundary.accepts(0, .{ .match = .{ .length = 3, .distance = 32769 } }));
 }
 

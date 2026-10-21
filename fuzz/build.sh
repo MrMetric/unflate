@@ -15,7 +15,7 @@ mkdir -p "$out"
 # Per-module flags precede each -M. ReleaseSafe keeps safety checks and
 # assertions, so invariant failures abort instead of corrupting silently.
 mod="-OReleaseSafe -target x86_64-linux-gnu -mcpu=x86_64_v3 -fno-stack-check -fno-stack-protector -fPIC"
-modules="--dep deflopt $mod -Mroot=fuzz/harness.zig $mod -Mdeflopt=src/deflopt.zig"
+modules="--dep containers $mod -Mroot=fuzz/harness.zig $mod -Mcontainers=src/containers.zig"
 
 zig build-obj -lc -fllvm --name harness -fno-emit-bin -femit-llvm-bc="$out/harness.bc" $modules
 afl-clang-lto -O2 -o "$out/unflate-fuzz" fuzz/driver.c "$out/harness.bc" -lzip -lz

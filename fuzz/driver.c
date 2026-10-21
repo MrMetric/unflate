@@ -43,7 +43,9 @@ enum target { T_DEFLATE = 0, T_GZIP = 1, T_PNG = 2, T_ZIP = 3 };
 
 /* Inputs whose reference decoding exceeds this are skipped before the
  * optimizer runs: decompression bombs only measure search time. */
+#ifndef MAX_PLAIN
 #define MAX_PLAIN ((size_t)1 << 20)
+#endif
 #define MAX_FILE ((size_t)1 << 20)
 
 static enum target target;
@@ -423,6 +425,7 @@ static enum status reference(enum target t, const uint8_t *in, size_t len, struc
 	return INVALID;
 }
 
+#ifndef UNFLATE_REFERENCE
 static const char *write_fixed;
 
 static void run_one(const uint8_t *given, size_t len)
@@ -551,3 +554,5 @@ int main(int argc, char **argv)
 }
 
 #endif
+
+#endif /* !UNFLATE_REFERENCE */

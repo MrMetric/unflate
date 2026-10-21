@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void
 	info.addOption([]const u8, "identity", identity(b));
 
 	const module = b.createModule(.{
-		.root_source_file = b.path("src/deflopt_cli.zig"),
+		.root_source_file = b.path("src/main.zig"),
 		.target = target,
 		.optimize = optimize,
 		.strip = optimize == .ReleaseFast or optimize == .ReleaseSmall,
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void
 	b.installArtifact(b.addExecutable(.{ .name = "unflate", .root_module = module }));
 
 	const tests = b.step("test", "Run native contract tests");
-	for([_][]const u8{ "src/cli_args.zig", "src/deflopt.zig" }) |source|
+	for([_][]const u8{ "src/cli_args.zig", "src/containers.zig" }) |source|
 	{
 		const test_module = b.createModule(.{
 			.root_source_file = b.path(source),

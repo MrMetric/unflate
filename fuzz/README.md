@@ -18,12 +18,16 @@ optimizer output must satisfy these checks:
   compressed text decoded; for ZIP the entry names, CRCs and contents;
 - a container output must not be larger than its input.
 
-By default, optimizer rejections do not fail the harness. With
+Optimizer verification failures always abort. Ordinary input rejections do not
+fail the harness by default. With
 `UNFLATE_FUZZ_STRICT=1`, rejecting reference-accepted input or changing
 reference-rejected input aborts. This also flags deliberate refusals, such
-as padded IDAT streams. The deflate target calls `optimizeDeflateBytes`
-directly, below the container checks, so its output check is the only one
-applied.
+as padded IDAT streams. The deflate target calls the raw `deflopt.optimize`
+interface, including its decoded-equality check. The C driver independently
+verifies the result.
+
+`python3 fuzz/test_harness.py` tests error handling with injected failures; it
+requires Zig but not AFL++ or libzip.
 
 Before each run the driver recomputes gzip CRC/ISIZE/FHCRC, PNG chunk CRCs
 and zlib FCHECK/Adler-32 (ZIP CRCs are left alone). Without this, nearly

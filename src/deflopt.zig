@@ -1,6 +1,5 @@
-//! DEFLATE re-encoding and bounded LZ77 reparsing.
-//! Uses the parser and block representation in deflasm.zig; container entry
-//! points preserve decoded content and metadata and reject file-size growth.
+//! Raw DEFLATE re-encoding, bounded LZ77 reparsing and decoded-content verification.
+//! Container framing and file policy live in the format modules.
 
 const std = @import("std");
 const common = @import("deflcommon.zig");
@@ -16,7 +15,6 @@ const ClEntry = deflasm.ClEntry;
 const lenCodeTable = common.lenCodeTable;
 const distCodeTable = common.distCodeTable;
 const HCLEN_ORDER = common.HCLEN_ORDER;
-const ERR = common.ERR;
 
 // Huffman ties use (frequency, creation index), including internal nodes.
 const HuffmanNode = struct {
@@ -302,7 +300,7 @@ pub fn makeDynamicBlock(alloc: std.mem.Allocator, tokens: []const Token, is_last
 			},
 		}
 	}
-	if (ll_freq[256] == 0) ll_freq[256] = 1; // EOB floor
+	if (ll_freq[common.EOB] == 0) ll_freq[common.EOB] = 1;
 	if (drop_258) {
 		// Omit LL symbol 285; length-258 matches route through 284+5+31
 		// (dynBlockCost / assemble pick 284 automatically when 285 is absent).
@@ -313,7 +311,7 @@ pub fn makeDynamicBlock(alloc: std.mem.Allocator, tokens: []const Token, is_last
 
 	var ll_full = [_]u8{0} ** 286;
 	freqToLengths(&ll_freq, 15, &ll_full);
-	const ll_len = trimLen(&ll_full, 257);
+	const ll_len = trimLen(&ll_full, common.EOB + 1);
 	const ll_lengths = try alloc.dupe(u8, ll_full[0..ll_len]);
 
 	var dist_lengths: []u8 = undefined;
@@ -338,7 +336,6 @@ pub fn makeDynamicBlock(alloc: std.mem.Allocator, tokens: []const Token, is_last
 
 	return .{ .is_last = is_last, .body = .{ .huff = .{
 		.is_fixed = false,
-		// Tokens share the candidate arena; dupeBlock owns winners across resets.
 		.tokens = tokens,
 		.ll_lengths = ll_lengths,
 		.dist_lengths = dist_lengths,
@@ -357,23 +354,7 @@ const MAX_NEAR_TIES: usize = 8;
 const SCRATCH_RETAIN_LIMIT: usize = 8 << 20;
 const SCRATCH_RESET: std.heap.ArenaAllocator.ResetMode = .{ .retain_with_limit = SCRATCH_RETAIN_LIMIT };
 
-// Fixed Huffman per-symbol bit lengths (RFC 1951 §3.2.6).
-const fixed_ll_bits: [288]u8 = blk: {
-	var a: [288]u8 = undefined;
-	var i: usize = 0;
-	while (i < 144) : (i += 1) a[i] = 8;
-	while (i < 256) : (i += 1) a[i] = 9;
-	while (i < 280) : (i += 1) a[i] = 7;
-	while (i < 288) : (i += 1) a[i] = 8;
-	break :blk a;
-};
-const fixed_ll_cost: [256]u8 = blk: {
-	var a: [256]u8 = undefined;
-	var i: usize = 0;
-	while (i < 144) : (i += 1) a[i] = 8;
-	while (i < 256) : (i += 1) a[i] = 9;
-	break :blk a;
-};
+const fixed_ll_bits = common.fixed_ll_lengths;
 
 fn clEntriesBits(cl_enc: *const common.HuffEnc(19), entries: []const ClEntry) i64 {
 	var bits: i64 = 0;
@@ -832,9 +813,9 @@ test "optimizer memo: exact CL keys, collisions, ownership and scope" {
 	defer memo.deinit();
 	const previous = swapOptimizerMemo(&memo);
 	defer _ = swapOptimizerMemo(previous);
-	var ll = [_]u8{0} ** 257;
+	var ll = [_]u8{0} ** (common.EOB + 1);
 	ll[65] = 1;
-	ll[256] = 1;
+	ll[common.EOB] = 1;
 	const dist = [_]u8{1};
 	for ([_]bool{ false, true }) |t24| {
 		cl_t24_arbitration = t24;
@@ -881,10 +862,10 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 	var tokens = [_]Token{.{ .lit = 65 }} ** 64;
 	tokens[0] = .{ .lit = 66 };
 	// Deliberately give the rare literal the shortest code.
-	var seed_ll = [_]u8{0} ** 257;
+	var seed_ll = [_]u8{0} ** (common.EOB + 1);
 	seed_ll[65] = 2;
 	seed_ll[66] = 1;
-	seed_ll[256] = 2;
+	seed_ll[common.EOB] = 2;
 	var seed_dist = [_]u8{1};
 	var saw_result = false;
 	for ([_]bool{ false, true }) |t24| {
@@ -917,9 +898,9 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 	}
 	try std.testing.expect(saw_result);
 	// A minimal two-symbol tree has no profitable polish. Null is reusable.
-	var ll = [_]u8{0} ** 257;
+	var ll = [_]u8{0} ** (common.EOB + 1);
 	ll[65] = 1;
-	ll[256] = 1;
+	ll[common.EOB] = 1;
 	var dist = [_]u8{1};
 	var h = fixedHuffBlock(tokens[1..2], true).body.huff;
 	h.ll_lengths = &ll;
@@ -1053,6 +1034,10 @@ pub fn swapMinDistCodes(next: u8) u8 {
 	min_dist_codes = next;
 	return previous;
 }
+pub fn minDistCodes() u8 {
+	return min_dist_codes;
+}
+
 /// Apply the floor to a freshly built 30-entry distance tree. freqToLengths
 /// and mergeTree give a single used symbol a 1-bit code and >= 2 symbols a
 /// complete tree, so only the single-symbol case needs the filler. The
@@ -1079,6 +1064,69 @@ pub fn swapReparse(enabled: bool) bool {
 	const previous = reparse_enabled;
 	reparse_enabled = enabled;
 	return previous;
+}
+
+/// Optional research override. Null selects the bounded production policy;
+/// a session with zero evaluations selects the pre-extension reparse search.
+pub const FeedbackSession = feedback.Session;
+// ── Exploration read grade ───────────────
+
+/// Grade of the read that the reparse walk and feedback controller apply to
+/// each exploration candidate. `full` is production: the old portfolio closed
+/// under restart (`optimizeBlockFast`). `single` is one classic configuration
+/// pass. `assemble` is the materialized block's own exact cost, no polishing.
+/// A candidate whose cheap cost is within `margin` bits of the record, or
+/// the walk's round winner when `winner_always`, is re-read at full grade
+/// before comparison. That read closes the fast portfolio, not the full
+/// production reparse/feedback search. Default: production.
+pub const ExploreRead = struct {
+	pub const Grade = enum(u8) { full = 0, single = 1, assemble = 2 };
+	grade: Grade = .full,
+	/// Grade for the feedback controller's completions; null follows `grade`.
+	feedback_grade: ?Grade = null,
+	margin: i64 = 0,
+	winner_always: bool = false,
+	/// Under `full`, also read each walk variant at the cheaper grades and
+	/// count whether they rank the round's two variants the same way.
+	measure_agreement: bool = false,
+};
+pub const ExploreStats = struct {
+	reads: [3]usize = .{ 0, 0, 0 },
+	hits: [3]usize = .{ 0, 0, 0 },
+	confirms: usize = 0,
+	confirm_gains: usize = 0,
+	rounds: usize = 0,
+	full_ties: usize = 0,
+	agree: [3]usize = .{ 0, 0, 0 },
+	disagree: [3]usize = .{ 0, 0, 0 },
+};
+threadlocal var explore_read: ExploreRead = .{};
+threadlocal var explore_stats: ExploreStats = .{};
+pub fn swapExploreRead(next: ExploreRead) ExploreRead {
+	const previous = explore_read;
+	explore_read = next;
+	return previous;
+}
+pub fn takeExploreStats() ExploreStats {
+	const s = explore_stats;
+	explore_stats = .{};
+	return s;
+}
+
+pub const FeedbackOrder = feedback.Order;
+/// Completion ordering and admission policy; defaults bound the production search.
+pub const FeedbackPolicy = struct { order: FeedbackOrder = .creation, cheap_contexts: bool = false };
+threadlocal var feedback_policy: FeedbackPolicy = .{};
+pub fn swapFeedbackPolicy(next: FeedbackPolicy) FeedbackPolicy {
+	const previous = feedback_policy;
+	feedback_policy = next;
+	return previous;
+}
+threadlocal var feedback_session: ?*FeedbackSession = null;
+pub fn swapFeedbackSearch(session: ?*FeedbackSession) ?*FeedbackSession {
+	const old = feedback_session;
+	feedback_session = session;
+	return old;
 }
 
 /// Exact tree, sweep, token-portfolio and encoded-read memos for related streams.
@@ -1381,9 +1429,7 @@ fn buildClUncached(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_length
 	// is used only for post-winner strict-gain polishing. Assembly derives
 	// HLIT/HDIST from the length arrays and ignores separator entries.
 	if (crossing) {
-		const combined = try alloc.alloc(u8, ll_lengths.len + dist_lengths.len);
-		@memcpy(combined[0..ll_lengths.len], ll_lengths);
-		@memcpy(combined[ll_lengths.len..], dist_lengths);
+		const combined = try std.mem.concat(alloc, u8, &.{ ll_lengths, dist_lengths });
 		for (0..4) |seed_i| {
 			var entries: std.ArrayList(ClEntry) = .empty;
 			if (seed_i == 0) {
@@ -1576,7 +1622,7 @@ fn dynCostFromFreqs(
 ) !i64 {
 	var ll_full = [_]u8{0} ** 286;
 	freqToLengths(ll_freq, 15, &ll_full);
-	const ll_len = trimLen(&ll_full, 257);
+	const ll_len = trimLen(&ll_full, common.EOB + 1);
 	const ll_lengths = ll_full[0..ll_len];
 
 	var dist_full = [_]u8{0} ** 30;
@@ -1624,7 +1670,7 @@ fn dynBlockCost(h: Huff) !i64 {
 
 	const ll_enc = common.HuffEnc(288).build(h.ll_lengths) orelse return error.Malformed;
 	const dist_enc = common.HuffEnc(32).build(h.dist_lengths) orelse return error.Malformed;
-	if (ll_enc.len[256] == 0) return error.Malformed; // EOB must exist
+	if (ll_enc.len[common.EOB] == 0) return error.Malformed;
 
 	for (h.tokens) |tok| {
 		switch (tok) {
@@ -1643,17 +1689,17 @@ fn dynBlockCost(h: Huff) !i64 {
 			},
 		}
 	}
-	return bits + ll_enc.len[256];
+	return bits + ll_enc.len[common.EOB];
 }
 
 fn fixedCost(tokens: []const Token, preserve_encoding: bool) i64 {
-	var bits: i64 = 3 + fixed_ll_bits[256];
+	var bits: i64 = 3 + fixed_ll_bits[common.EOB];
 	for (tokens) |tok| {
 		switch (tok) {
-			.lit => |b| bits += fixed_ll_cost[b],
+			.lit => |b| bits += fixed_ll_bits[b],
 			.match => |m| {
-				const lc = if (preserve_encoding and m.original_alt258 and m.length == 258)
-					lenCodeTable[257] // symbol 284 + five extra bits
+				const lc = if (preserve_encoding and m.original_alt258 and m.length == common.MAX_MATCH_LENGTH)
+					lenCodeTable[common.MAX_MATCH_LENGTH - 1] // symbol 284 + five extra bits
 				else lenCodeTable[m.length];
 				const dc = distCodeTable[m.distance];
 				bits += @as(i64, fixed_ll_bits[lc.code]) + lc.extra + 5 + dc.extra;
@@ -1665,9 +1711,9 @@ fn fixedCost(tokens: []const Token, preserve_encoding: bool) i64 {
 
 /// Fixed-Huffman cost of a fully-literal block. raw_freq[b] = count of byte b.
 fn fixAllLitsCost(raw_freq: []const u32) i64 {
-	var bits: i64 = 3 + fixed_ll_bits[256];
+	var bits: i64 = 3 + fixed_ll_bits[common.EOB];
 	for (raw_freq, 0..) |c, b| {
-		if (c > 0) bits += @as(i64, c) * fixed_ll_cost[b];
+		if (c > 0) bits += @as(i64, c) * fixed_ll_bits[b];
 	}
 	return bits;
 }
@@ -1772,7 +1818,7 @@ fn precomputeMatchLits(alloc: std.mem.Allocator, tokens: []const Token, program:
 	}
 	if (pos != program.raw().len) @panic("candidate changed program length");
 	std.debug.assert(mi == nmatches);
-	if (base_ll_freq[256] == 0) base_ll_freq[256] = 1; // EOB floor
+	if (base_ll_freq[common.EOB] == 0) base_ll_freq[common.EOB] = 1;
 	return .{
 		.tokens = tokens,
 		.matches = matches,
@@ -1817,7 +1863,7 @@ const FixedResult = struct { tokens: []Token, cost: i64 };
 
 fn optFixed(alloc: std.mem.Allocator, orig_tokens: []const Token, matches: []const MatchInfo) !FixedResult {
 	var out: std.ArrayList(Token) = .empty;
-	var bits: i64 = 3 + fixed_ll_bits[256];
+	var bits: i64 = 3 + fixed_ll_bits[common.EOB];
 	var m: usize = 0;
 	for (orig_tokens, 0..) |tok, i| {
 		if (m < matches.len and matches[m].tok_index == i) {
@@ -1825,7 +1871,7 @@ fn optFixed(alloc: std.mem.Allocator, orig_tokens: []const Token, matches: []con
 			m += 1;
 			const mc: i64 = @as(i64, fixed_ll_bits[mi.lc]) + mi.xn + 5 + mi.dn;
 			var lc_cost: i64 = 0;
-			for (mi.lits) |b| lc_cost += fixed_ll_cost[b];
+			for (mi.lits) |b| lc_cost += fixed_ll_bits[b];
 			if (lc_cost <= mc) {
 				for (mi.lits) |b| try out.append(alloc, .{ .lit = b });
 				bits += lc_cost;
@@ -1835,7 +1881,7 @@ fn optFixed(alloc: std.mem.Allocator, orig_tokens: []const Token, matches: []con
 			}
 		} else {
 			try out.append(alloc, tok);
-			bits += fixed_ll_cost[tok.lit];
+			bits += fixed_ll_bits[tok.lit];
 		}
 	}
 	return .{ .tokens = out.items, .cost = bits };
@@ -1852,6 +1898,25 @@ fn expandMatch(ll_freq: []u32, dist_freq: []u32, kept_extra: *i64, mi: MatchInfo
 	}
 	dist_freq[mi.dc] -= 1;
 	for (mi.hist) |hc| ll_freq[hc.byte] += hc.count;
+}
+
+// Prices are frozen for a whole round, even as its frequency counts change.
+const ExpansionPrices = struct { ll: [286]u8, dist: [30]u8 };
+fn expansionPrices(ll_freq: *const [286]u32, dist_freq: *const [30]u32) ExpansionPrices {
+	var prices: ExpansionPrices = .{ .ll = undefined, .dist = @splat(0) };
+	freqToLengths(ll_freq, 15, &prices.ll);
+	var any_dist = false;
+	for (dist_freq) |f| if (f > 0) { any_dist = true; };
+	if (any_dist) {
+		freqToLengths(dist_freq, 15, &prices.dist);
+		distFloor(&prices.dist);
+	}
+	// These are generated trees; encoding supplied trees still validates them.
+	std.debug.assert(common.HuffEnc(288).build(&prices.ll) != null);
+	std.debug.assert(common.HuffEnc(32).build(&prices.dist) != null);
+	for (&prices.ll) |*l| if (l.* == 0) { l.* = 15; };
+	for (&prices.dist) |*l| if (l.* == 0) { l.* = 15; };
+	return prices;
 }
 
 const NearTie = struct { idx: usize, delta: i64 };
@@ -1889,28 +1954,8 @@ fn optDynamic(
 	if (drop_258) ll_freq[285] = 0; // never let 285 enter the table
 
 	while (true) {
-		var ll_full = [_]u8{0} ** 286;
-		freqToLengths(&ll_freq, 15, &ll_full);
-		var dist_full = [_]u8{0} ** 30;
-		var any_dist = false;
-		for (dist_freq) |f| {
-			if (f > 0) any_dist = true;
-		}
-		var zero = [_]u8{0};
-		var dist_lengths: []u8 = &zero;
-		if (any_dist) {
-			freqToLengths(&dist_freq, 15, &dist_full);
-			distFloor(&dist_full);
-			dist_lengths = dist_full[0..];
-		}
-		_ = cost_scratch.reset(SCRATCH_RESET);
-		const ll_enc = common.HuffEnc(288).build(&ll_full) orelse return error.Malformed;
-		const dist_enc = common.HuffEnc(32).build(dist_lengths) orelse return error.Malformed;
-
-		var byte_costs: [256]u32 = undefined;
-		for (0..256) |b| byte_costs[b] = if (ll_enc.len[b] == 0) 15 else ll_enc.len[b];
-
-		var greedy: std.ArrayList(usize) = .empty;
+		const prices = expansionPrices(&ll_freq, &dist_freq);
+		var greedy = false;
 		var near_ties: std.ArrayList(NearTie) = .empty;
 
 		for (matches, 0..) |mi, idx| {
@@ -1918,31 +1963,27 @@ fn optDynamic(
 			var ll_b: i64 = undefined;
 			var m_extra: i64 = undefined;
 			if (drop_258 and mi.lc == 285) {
-				ll_b = if (ll_enc.len[284] == 0) 15 else ll_enc.len[284];
+				ll_b = prices.ll[284];
 				m_extra = 5;
 			} else {
-				ll_b = if (ll_enc.len[mi.lc] == 0) 15 else ll_enc.len[mi.lc];
+				ll_b = prices.ll[mi.lc];
 				m_extra = mi.xn;
 			}
-			const d_b: i64 = if (dist_enc.len[mi.dc] == 0) 15 else dist_enc.len[mi.dc];
+			const d_b: i64 = prices.dist[mi.dc];
 			const mc: i64 = ll_b + m_extra + d_b + mi.dn;
 			var lc_cost: i64 = 0;
-			for (mi.hist) |hc| lc_cost += @as(i64, hc.count) * byte_costs[hc.byte];
+			for (mi.hist) |hc| lc_cost += @as(i64, hc.count) * prices.ll[hc.byte];
 			const delta = mc - lc_cost;
 			if (delta > TIE_THRESHOLD) {
-				try greedy.append(alloc, idx);
+				expandMatch(&ll_freq, &dist_freq, &kept_extra, mi, drop_258);
+				expanded[idx] = true;
+				greedy = true;
 			} else if (delta >= -TIE_THRESHOLD) {
 				try near_ties.append(alloc, .{ .idx = idx, .delta = delta });
 			}
 		}
 
-		if (greedy.items.len > 0) {
-			for (greedy.items) |idx| {
-				expandMatch(&ll_freq, &dist_freq, &kept_extra, matches[idx], drop_258);
-				expanded[idx] = true;
-			}
-			continue;
-		}
+		if (greedy) continue;
 		if (near_ties.items.len == 0) break;
 
 		if (near_ties.items.len > MAX_NEAR_TIES) {
@@ -2002,12 +2043,14 @@ fn optDynamic(
 	return applyExpansions(alloc, orig_tokens, matches, expanded);
 }
 
+const BIDIR_MAX_ROUNDS = 100;
+
 // Bidirectional batch greedy: optDynamic's
 // greedy loop with an UN-EXPAND direction, no tie window, no B&B, no drop-258
 // routing. Monotone batch expansion can overshoot (all deltas priced under
 // the pre-batch tree); here every match is re-priced each round and moved
-// strictly-profitably in either direction; fixpoint or 100 rounds
-// (oscillation guard). One more candidate stream
+// strictly-profitably in either direction, bounded by BIDIR_MAX_ROUNDS
+// to stop oscillation. One more candidate stream
 // for optimizeBlock's exact compare.
 fn optDynamicBidir(
 	alloc: std.mem.Allocator,
@@ -2025,62 +2068,31 @@ fn optDynamicBidir(
 		dist_freq[mi.dc] += 1;
 	}
 
-	// Same cost-evaluation scratch as optDynamic: freqToLengths temps are pure.
-	var cost_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-	defer cost_scratch.deinit();
-
 	var round: usize = 0;
-	while (round < 100) : (round += 1) {
-		var ll_full = [_]u8{0} ** 286;
-		freqToLengths(&ll_freq, 15, &ll_full);
-		var dist_full = [_]u8{0} ** 30;
-		var any_dist = false;
-		for (dist_freq) |f| {
-			if (f > 0) any_dist = true;
-		}
-		var zero = [_]u8{0};
-		var dist_lengths: []u8 = &zero;
-		if (any_dist) {
-			freqToLengths(&dist_freq, 15, &dist_full);
-			distFloor(&dist_full);
-			dist_lengths = dist_full[0..];
-		}
-		_ = cost_scratch.reset(SCRATCH_RESET);
-		const ll_enc = common.HuffEnc(288).build(&ll_full) orelse return error.Malformed;
-		const dist_enc = common.HuffEnc(32).build(dist_lengths) orelse return error.Malformed;
-
-		var byte_costs: [256]u32 = undefined;
-		for (0..256) |b| byte_costs[b] = if (ll_enc.len[b] == 0) 15 else ll_enc.len[b];
-
-		var to_expand: std.ArrayList(usize) = .empty;
-		var to_unexpand: std.ArrayList(usize) = .empty;
+	while (round < BIDIR_MAX_ROUNDS) : (round += 1) {
+		const prices = expansionPrices(&ll_freq, &dist_freq);
+		var changed = false;
 		for (matches, 0..) |mi, idx| {
-			const ll_b: i64 = if (ll_enc.len[mi.lc] == 0) 15 else ll_enc.len[mi.lc];
-			const d_b: i64 = if (dist_enc.len[mi.dc] == 0) 15 else dist_enc.len[mi.dc];
+			const ll_b: i64 = prices.ll[mi.lc];
+			const d_b: i64 = prices.dist[mi.dc];
 			const mc: i64 = ll_b + mi.xn + d_b + mi.dn;
 			var lc_cost: i64 = 0;
-			for (mi.hist) |hc| lc_cost += @as(i64, hc.count) * byte_costs[hc.byte];
+			for (mi.hist) |hc| lc_cost += @as(i64, hc.count) * prices.ll[hc.byte];
 			if (expanded[idx]) {
-				if (mc < lc_cost) try to_unexpand.append(alloc, idx);
-			} else if (lc_cost < mc) {
-				try to_expand.append(alloc, idx);
+				if (mc >= lc_cost) continue;
+				ll_freq[mi.lc] += 1;
+				dist_freq[mi.dc] += 1;
+				for (mi.hist) |hc| ll_freq[hc.byte] -= hc.count;
+			} else {
+				if (lc_cost >= mc) continue;
+				ll_freq[mi.lc] -= 1;
+				dist_freq[mi.dc] -= 1;
+				for (mi.hist) |hc| ll_freq[hc.byte] += hc.count;
 			}
+			expanded[idx] = !expanded[idx];
+			changed = true;
 		}
-		if (to_expand.items.len == 0 and to_unexpand.items.len == 0) break;
-		for (to_expand.items) |idx| {
-			const mi = matches[idx];
-			ll_freq[mi.lc] -= 1;
-			dist_freq[mi.dc] -= 1;
-			for (mi.hist) |hc| ll_freq[hc.byte] += hc.count;
-			expanded[idx] = true;
-		}
-		for (to_unexpand.items) |idx| {
-			const mi = matches[idx];
-			ll_freq[mi.lc] += 1;
-			dist_freq[mi.dc] += 1;
-			for (mi.hist) |hc| ll_freq[hc.byte] -= hc.count;
-			expanded[idx] = false;
-		}
+		if (!changed) break;
 	}
 	return applyExpansions(alloc, orig_tokens, matches, expanded);
 }
@@ -3253,7 +3265,7 @@ const ExactFound = struct { is_ll: bool, sv: []u8, dp: i64, total: i64 };
 /// Compare same-depth triples by exact cost: literal/length then distance,
 /// ascending depth, forward before inverse, x1 before x2. Accept strict gains.
 fn polishExactPass(alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAllocator, ll: []u8, dist: []u8, llf: []const u32, df: []const u32, cur_dp: i64) !?ExactFound {
-	const tl = trimLen(ll, 257);
+	const tl = trimLen(ll, common.EOB + 1);
 	const td = trimLen(dist, 1);
 	var built = try buildClCost(cost_scratch, ll[0..tl], dist[0..td]);
 	const base_total = built.header_bits + cur_dp;
@@ -3284,7 +3296,7 @@ fn polishExactPass(alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAlloca
 					for (sec.freqs, sv, sec.seq) |f, nv, ov| {
 						if (nv != ov) dp += @as(i64, f) * (@as(i64, nv) - ov);
 					}
-					const ta = trimLen(sv, if (sec.is_ll) 257 else 1);
+					const ta = trimLen(sv, if (sec.is_ll) common.EOB + 1 else 1);
 					built = if (sec.is_ll)
 						try buildClCost(cost_scratch, sv[0..ta], dist[0..td])
 					else
@@ -3318,12 +3330,12 @@ fn polishLengths(alloc: std.mem.Allocator, h: Huff) !?PolishResult {
 		.lit => |b| llf[b] += 1,
 		.match => |m| {
 			var sym: usize = lenCodeTable[m.length].code;
-			if (m.length == 258 and !has285) sym = 284;
+			if (m.length == common.MAX_MATCH_LENGTH and !has285) sym = 284;
 			llf[sym] += 1;
 			df[distCodeTable[m.distance].code] += 1;
 		},
 	};
-	llf[256] += 1; // EOB
+	llf[common.EOB] += 1;
 	if (active_optimizer_memo) |memo| {
 		if (ll.len <= 288 and dist.len <= 32) {
 			const slot = memo.polishSlot(ll, dist, llf, df);
@@ -3438,7 +3450,7 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 					improved = improved or res2.improved;
 				}
 			}
-			const tl = trimLen(ll, 257);
+			const tl = trimLen(ll, common.EOB + 1);
 			const td = trimLen(dist, 1);
 			built = try buildClCost(&cost_scratch, ll[0..tl], dist[0..td]);
 			const ex = built.header_bits;
@@ -3459,7 +3471,7 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 		cur_dp = found.dp;
 		if (found.total < best_total) {
 			best_total = found.total;
-			best_ll = try alloc.dupe(u8, ll[0..trimLen(ll, 257)]);
+			best_ll = try alloc.dupe(u8, ll[0..trimLen(ll, common.EOB + 1)]);
 			best_dist = try alloc.dupe(u8, dist[0..trimLen(dist, 1)]);
 		}
 	}
@@ -3669,7 +3681,7 @@ const ProjectionMemo = struct {
 	offset: u3 = 0,
 	raw: []const u8 = &.{},
 	prior: []const u8 = &.{},
-	cache: std.StringHashMapUnmanaged([]const u8) = .empty,
+	caches: [3]std.StringHashMapUnmanaged([]const u8) = .{ .empty, .empty, .empty },
 	cached_bytes: usize = 0,
 	limit: usize = 32 * 1024 * 1024,
 
@@ -3680,7 +3692,7 @@ const ProjectionMemo = struct {
 	}
 
 	fn clear(self: *ProjectionMemo) void {
-		self.cache = .empty;
+		self.caches = .{ .empty, .empty, .empty };
 		_ = self.arena.reset(.free_all);
 		self.cached_bytes = 0;
 	}
@@ -3696,11 +3708,11 @@ const ProjectionMemo = struct {
 		self.bound = true;
 	}
 
-	fn remember(self: *ProjectionMemo, key: []const u8, value: []const u8) !void {
+	fn remember(self: *ProjectionMemo, grade: ExploreRead.Grade, key: []const u8, value: []const u8) !void {
 		std.debug.assert(self.bound);
 		if (key.len + value.len > self.limit) return;
 		if (self.cached_bytes + key.len + value.len > self.limit) self.clear();
-		const cache = &self.cache;
+		const cache = &self.caches[@intFromEnum(grade)];
 		if (cache.contains(key)) return;
 		const a = self.arena.allocator();
 		try cache.put(a, try a.dupe(u8, key), try a.dupe(u8, value));
@@ -3708,40 +3720,43 @@ const ProjectionMemo = struct {
 	}
 };
 
-test "projection memo isolates decoded bytes history and eviction ownership" {
+test "projection memo isolates decoded bytes history grades and eviction ownership" {
 	const a = std.testing.allocator;
 	var memo: ProjectionMemo = .{ .inputs = std.heap.ArenaAllocator.init(a), .arena = std.heap.ArenaAllocator.init(a), .limit = 24 };
 	defer memo.deinit();
 	var raw = [_]u8{ 65, 65, 65 };
 	var prior = [_]u8{65};
 	try memo.bind(&raw, &prior);
-	try memo.remember("in", "full");
-	try std.testing.expectEqualStrings("full", memo.cache.get("in").?);
+	try memo.remember(.full, "in", "full");
+	try memo.remember(.single, "in", "single");
+	try std.testing.expectEqualStrings("full", memo.caches[0].get("in").?);
+	try std.testing.expectEqualStrings("single", memo.caches[1].get("in").?);
+	try std.testing.expect(memo.caches[2].get("in") == null);
 	// Matching contents keep work; a caller mutating the same storage must
 	// invalidate it, proving the binding owns values rather than pointers.
 	try memo.bind(&raw, &prior);
-	try std.testing.expect(memo.cache.contains("in"));
+	try std.testing.expect(memo.caches[0].contains("in"));
 	raw[0] = 66;
 	try memo.bind(&raw, &prior);
-	try std.testing.expect(!memo.cache.contains("in"));
-	try memo.remember("in", "new");
+	try std.testing.expect(!memo.caches[0].contains("in"));
+	try memo.remember(.full, "in", "new");
 	prior[0] = 66;
 	try memo.bind(&raw, &prior);
-	try std.testing.expect(!memo.cache.contains("in"));
-	try memo.remember("in", "new");
-	try memo.remember("another", "123456789012");
-	try memo.remember("third", "fourth");
-	try std.testing.expect(!memo.cache.contains("in"));
-	try std.testing.expectEqualStrings("fourth", memo.cache.get("third").?);
+	try std.testing.expect(!memo.caches[0].contains("in"));
+	try memo.remember(.full, "in", "new");
+	try memo.remember(.full, "another", "123456789012");
+	try memo.remember(.single, "third", "fourth");
+	try std.testing.expect(!memo.caches[0].contains("in"));
+	try std.testing.expectEqualStrings("fourth", memo.caches[1].get("third").?);
 	try memo.bind(&raw, &prior);
-	try std.testing.expect(memo.cache.contains("third"));
+	try std.testing.expect(memo.caches[1].contains("third"));
 	try std.testing.expectEqualSlices(u8, &raw, memo.raw);
 	try std.testing.expectEqualSlices(u8, &prior, memo.prior);
 	const previous = block_offset;
 	defer block_offset = previous;
 	block_offset = 3;
 	try memo.bind(&raw, &prior);
-	try std.testing.expect(!memo.cache.contains("third"));
+	try std.testing.expect(!memo.caches[1].contains("third"));
 }
 
 test "caller memo preserves block results across warm calls and changed history" {
@@ -3776,21 +3791,93 @@ test "caller memo preserves block results across warm calls and changed history"
 	}
 }
 
+fn withinConfirmMargin(cheap_bits: i64, record_bits: i64, margin: i64) bool {
+	// The CLI accepts every i64 margin. Widen before adding so even an
+	// effectively unbounded margin retains its mathematical meaning.
+	return @as(i128, cheap_bits) <= @as(i128, record_bits) + margin;
+}
+
+test "confirmation margin compares accepted i64 extremes without overflow" {
+	try std.testing.expect(withinConfirmMargin(20, 16, std.math.maxInt(i64)));
+	try std.testing.expect(!withinConfirmMargin(0, 16, std.math.minInt(i64)));
+	try std.testing.expect(withinConfirmMargin(20, 16, 4));
+	try std.testing.expect(!withinConfirmMargin(21, 16, 4));
+	try std.testing.expect(withinConfirmMargin(12, 16, -4));
+	try std.testing.expect(!withinConfirmMargin(13, 16, -4));
+}
+
 const ReparseContext = struct {
 	sub: *std.heap.ArenaAllocator,
 	states: *[2]std.heap.ArenaAllocator,
 	graph: ir.Graph,
 	projection: *ProjectionMemo,
 
-	/// Normalize through assembly before running the full re-encoding portfolio.
+	fn feedbackGrade() ExploreRead.Grade {
+		return explore_read.feedback_grade orelse explore_read.grade;
+	}
+
+	/// Whether the feedback controller's read of `encoded` is already cached.
+	pub fn cached(self: *ReparseContext, encoded: []const u8) bool {
+		return self.projection.caches[@intFromEnum(feedbackGrade())].contains(encoded);
+	}
+
+	/// The feedback controller's exploration read: production's full
+	/// projection unless a research grade is selected (`ExploreRead`).
 	pub fn polishEncoded(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8) !Block {
-		if (self.projection.cache.get(encoded)) |value| return blockFromBytes(a, value);
+		return self.polishEncodedGrade(a, encoded, feedbackGrade());
+	}
+
+	/// A single-pass read of `encoded`, for admitting non-fixed-point contexts.
+	pub fn polishEncodedCheap(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8) !Block {
+		return self.polishEncodedGrade(a, encoded, .single);
+	}
+
+	/// Re-read `encoded` at full grade when its cheap read is close enough to
+	/// the record to matter, or when it is the walk's round winner under
+	/// `winner_always`. Null when that consumer's grade is already full or the
+	/// candidate is not worth confirming. Every adopted record passes here.
+	pub fn confirmEncoded(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8, cheap_bits: i64, record_bits: i64, walk: bool) !?Block {
+		const er = explore_read;
+		const grade = if (walk) er.grade else feedbackGrade();
+		if (grade == .full) return null;
+		if (!((walk and er.winner_always) or withinConfirmMargin(cheap_bits, record_bits, er.margin))) return null;
+		const rich = try self.polishEncodedGrade(a, encoded, .full);
+		explore_stats.confirms += 1;
+		if (try blockCost(rich) < cheap_bits) explore_stats.confirm_gains += 1;
+		return rich;
+	}
+
+	fn polishEncodedGrade(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8, grade: ExploreRead.Grade) !Block {
+		const g = @intFromEnum(grade);
+		if (self.projection.caches[g].get(encoded)) |value| {
+			explore_stats.hits[g] += 1;
+			return blockFromBytes(a, value);
+		}
+		explore_stats.reads[g] += 1;
+		// Assembly/reparse is a projection boundary: the old portfolio must
+		// see precisely the encoding a fresh external invocation would see.
 		const normalized = try blockFromBytes(a, encoded);
-		const polished = try optimizeBlockFast(a, self.sub, self.states, normalized, self.graph.program);
+		const polished = switch (grade) {
+			.full => try optimizeBlockFast(a, self.sub, self.states, normalized, self.graph.program),
+			.single => blk: {
+				// One classic configuration pass: no restart closure or expanded seed portfolio.
+				std.debug.assert(!cl_t24_arbitration);
+				_ = self.sub.reset(SCRATCH_RESET);
+				const pc = try precomputeBlock(self.sub.allocator(), normalized, self.graph.program);
+				const pass = try optimizeBlockCfg(self.sub.allocator(), normalized, pc);
+				self.graph.program.check(pass.block);
+				break :blk pass;
+			},
+			.assemble => {
+				// No optimization: the candidate's own exact cost is the read.
+				self.graph.program.check(normalized);
+				return normalized;
+			},
+		};
 		const output = try blockBytes(a, polished.block);
 		const result = try blockFromBytes(a, output);
 		if (try blockCost(result) != polished.bits) @panic("reparse serialized cost mismatch");
-		try self.projection.remember(encoded, output);
+		try self.projection.remember(grade, encoded, output);
 		return result;
 	}
 
@@ -3818,18 +3905,45 @@ const ReparseContext = struct {
 				error.NonFiniteCost => @panic("finite scale-zero reparse costs overflowed"),
 				error.OutOfMemory => return error.OutOfMemory,
 			};
+			const er = explore_read;
 			const nvariants: usize = if (h.is_fixed) 1 else 2;
 			var chosen: Block = undefined;
 			var chosen_bits: i64 = std.math.maxInt(i64);
+			var chosen_bytes: []const u8 = &.{};
+			var costs: [2][3]i64 = .{ .{ 0, 0, 0 }, .{ 0, 0, 0 } };
 			for (0..nvariants) |v| {
 				const variant = try reparse.materialize(ra, parsed.tokens, if (v == 0) null else h, seed.is_last);
 				const vbytes = try blockBytes(ra, variant);
-				const polished = try self.polishEncoded(ra, vbytes);
+				const polished = try self.polishEncodedGrade(ra, vbytes, er.grade);
 				const cost = try blockCost(polished);
+				costs[v][@intFromEnum(er.grade)] = cost;
+				if (er.grade == .full and er.measure_agreement) {
+					for ([_]ExploreRead.Grade{ .single, .assemble }) |g| {
+						costs[v][@intFromEnum(g)] = try blockCost(try self.polishEncodedGrade(ra, vbytes, g));
+					}
+				}
 				if (cost < chosen_bits) {
 					chosen = polished;
 					chosen_bits = cost;
+					chosen_bytes = vbytes;
 				}
+			}
+			explore_stats.rounds += 1;
+			if (er.grade == .full and er.measure_agreement and nvariants == 2) {
+				// Do the cheap grades rank the two variants as the full read does?
+				if (costs[0][0] == costs[1][0]) {
+					explore_stats.full_ties += 1;
+				} else {
+					const full_pick: usize = if (costs[1][0] < costs[0][0]) 1 else 0;
+					for (1..3) |g| {
+						const pick: usize = if (costs[1][g] < costs[0][g]) 1 else 0;
+						if (pick == full_pick) explore_stats.agree[g] += 1 else explore_stats.disagree[g] += 1;
+					}
+				}
+			}
+			if (try self.confirmEncoded(ra, chosen_bytes, chosen_bits, best_bits, true)) |rich| {
+				chosen = rich;
+				chosen_bits = try blockCost(rich);
 			}
 			const bytes = try blockBytes(ra, chosen);
 			// Equality, not a digest alone, decides whether the walk repeats.
@@ -3951,6 +4065,9 @@ fn optimizeBlockAt(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, stat
 	if (!reparse_enabled or baseline.block.body != .huff or baseline.raw.len < 3 or baseline.raw.len > REPARSE_MAX_RAW) return baseline;
 	var search_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer search_arena.deinit();
+	var production_feedback: FeedbackSession = .{ .a = search_arena.allocator(),
+		.options = .{ .evaluations = FEEDBACK_EVALUATIONS, .order = feedback_policy.order, .cheap_contexts = feedback_policy.cheap_contexts }, .record_trials = false };
+	const selected_feedback = feedback_session orelse &production_feedback;
 	const projection = &active_optimizer_memo.?.projection;
 	try projection.bind(program.raw(), program.prior());
 	var ctx: ReparseContext = .{
@@ -3972,7 +4089,7 @@ fn optimizeBlockAt(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, stat
 		var candidate_cost = try blockCost(candidate);
 		if (candidate_cost > cost) @panic("reparse search grew its seed");
 		if (candidate_cost == cost) {
-			candidate = try feedback.run(winners[next].allocator(), candidate, ctx.graph, &ctx, FEEDBACK_EVALUATIONS);
+			candidate = try feedback.run(winners[next].allocator(), candidate, ctx.graph, &ctx, selected_feedback);
 			candidate_cost = try blockCost(candidate);
 			if (candidate_cost > cost) @panic("feedback search grew its incumbent");
 			if (candidate_cost == cost) break;
@@ -4056,7 +4173,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 	for (raw) |b| raw_freq[b] += 1;
 	const all_fix_cost = fixAllLitsCost(raw_freq[0..256]);
 	var raw_ll_freq: [286]u32 = raw_freq;
-	if (raw_ll_freq[256] == 0) raw_ll_freq[256] = 1;
+	if (raw_ll_freq[common.EOB] == 0) raw_ll_freq[common.EOB] = 1;
 	var empty_dist = [_]u32{0} ** 30;
 	const all_dyn_cost = try dynCostFromFreqs(alloc, &raw_ll_freq, &empty_dist, 0, .full);
 
@@ -4066,7 +4183,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 	var has_258_orig = false;
 	for (orig_tokens) |tok| switch (tok) {
 		.match => |m| {
-			if (m.length == 258) has_258_orig = true;
+			if (m.length == common.MAX_MATCH_LENGTH) has_258_orig = true;
 		},
 		.lit => {},
 	};
@@ -4112,7 +4229,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 		var has258 = false;
 		for (toks) |tok| switch (tok) {
 			.match => |m| {
-				if (m.length == 258) has258 = true;
+				if (m.length == common.MAX_MATCH_LENGTH) has258 = true;
 			},
 			.lit => {},
 		};
@@ -4134,6 +4251,8 @@ fn cloneStreamPortfolio(alloc: std.mem.Allocator, p: StreamPortfolio) !StreamPor
 	result.fixed.tokens = try alloc.dupe(Token, p.fixed.tokens);
 	return result;
 }
+const PORTFOLIO_MAX_ENTRY_BYTES = 256 * 1024;
+
 fn streamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamPortfolio {
 	const orig_tokens = pc.tokens;
 	const memo = active_optimizer_memo orelse return buildStreamPortfolio(alloc, block, pc);
@@ -4157,7 +4276,7 @@ fn streamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamP
 	// Bound retained payload, not just entry count. Trees/entries add less
 	// than 4 KiB; arena capacity overhead is included in storageBytes().
 	const bytes = key.len * @sizeOf(u64) + pc.raw.len + (result.dynamic.body.huff.tokens.len + result.fixed.tokens.len) * @sizeOf(Token) + 4096;
-	if (bytes <= 256 * 1024) {
+	if (bytes <= PORTFOLIO_MAX_ENTRY_BYTES) {
 		slot.valid = false;
 		_ = slot.arena.reset(.free_all);
 		const a = slot.arena.allocator();
@@ -4180,7 +4299,7 @@ test "stream portfolio memo isolates mode keys history and caller ownership" {
 	defer _ = swapOptimizerMemo(previous_memo);
 	const previous_mode = cl_t24_arbitration;
 	defer cl_t24_arbitration = previous_mode;
-	var tokens = [_]Token{ .{ .lit = 65 }, .{ .match = .{ .length = 258, .distance = 1 } }, .{ .lit = 66 } };
+	var tokens = [_]Token{ .{ .lit = 65 }, .{ .match = .{ .length = common.MAX_MATCH_LENGTH, .distance = 1 } }, .{ .lit = 66 } };
 	for ([_]bool{ false, true }) |mode| {
 		cl_t24_arbitration = mode;
 		for ([_]bool{ false, true }) |last| {
@@ -4288,16 +4407,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 	var cur_best = best;
 	switch (result.block.body) {
 		.huff => |h| if (!h.is_fixed) {
-			if (try polishLengths(alloc, h)) |pol| {
-				const built = try buildCl(alloc, pol.ll, pol.dist);
-				const pol_huff: Huff = .{
-					.is_fixed = false,
-					.tokens = h.tokens,
-					.ll_lengths = pol.ll,
-					.dist_lengths = pol.dist,
-					.cl_lengths = built.cl_lengths,
-					.cl_entries = built.entries.items,
-				};
+			if (try polishedOf(alloc, h)) |pol_huff| {
 				const pol_cost = try dynBlockCost(pol_huff);
 				if (pol_cost < cur_best) {
 					result.block = .{ .is_last = block.is_last, .body = .{ .huff = pol_huff } };
@@ -4440,7 +4550,7 @@ test "codebook identity ignores header spelling but includes both alphabets" {
 	try std.testing.expect(!sameCodebooks(original, padded));
 	@memset(padded.dist_lengths, 0);
 	@memcpy(padded.dist_lengths[0..original.dist_lengths.len], original.dist_lengths);
-	std.mem.swap(u8, &padded.ll_lengths[65], &padded.ll_lengths[256]);
+	std.mem.swap(u8, &padded.ll_lengths[65], &padded.ll_lengths[common.EOB]);
 	try std.testing.expect(!sameCodebooks(original, padded));
 	try std.testing.expect(!sameCodebooks(original, fixedHuffBlock(&tokens, true).body.huff));
 }
@@ -4455,7 +4565,7 @@ const HuffmanRun = struct {
 	payload_bits: i64 = 0,
 	blocks: usize = 0,
 	joined: bool = false,
-	prior: [32768]u8 = undefined,
+	prior: [common.WINDOW_SIZE]u8 = undefined,
 	prior_len: usize = 0,
 	is_last: bool = false,
 	padding: ?deflasm.BitPadding = null,
@@ -4547,22 +4657,16 @@ fn emitBlock(w: *common.BitWriter, block: Block, prior: []const u8) !struct { sp
 	return .{ .split = false, .last_header = last_header };
 }
 
-/// Streaming optimization with one BitReader and one BitWriter. Each block
-/// is parsed and optimized in scratch, folded into the 32 KiB history, and
-/// emitted or added to a pending Huffman run. Memory holds the output,
-/// pending tokens, and one block's working set.
-/// Empty blocks transfer BFINAL to the last emitted header; an entirely
-/// empty stream retains one optimized final block.
-fn optimizeDeflateFused(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8) deflasm.ParseError!void {
-	var consumed: usize = undefined;
-	try optimizeDeflateFusedConsumed(a, out, in, &consumed);
-}
-
-/// The fused loop, additionally reporting the consumed byte length of the
-/// deflate stream (final block's last bit rounded up to a byte) — the
-/// gzip-envelope caller walks members by it instead of running a separate
-/// token-materializing probe parse per member (parseDeflateConsumed did a
-/// full second parse of every member just to learn this number).
+/// Streaming loop with one reader and one writer.
+/// Each block is parsed and optimized in per-block scratch, folded into the
+/// 32 KB window, and either emitted or added to the pending Huffman run. Memory
+/// holds the output buffer, pending run tokens and one block's working set.
+/// parseBlock has no cross-block token dependence: matches stay symbolic;
+/// only the optimizer needs decoded context, via the window.
+/// Empty blocks are omitted; trailing empties transfer BFINAL to the last
+/// emitted header. An entirely empty stream retains one optimized final block.
+/// Reports consumed bytes (the final block's last bit rounded up), so callers
+/// can walk concatenated streams without a separate probe parse.
 fn optimizeDeflateFusedConsumed(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize) deflasm.ParseError!void {
 	const start = out.items.len;
 	var joined = try optimizeDeflatePass(a, out, in, consumed_bytes, true);
@@ -4589,7 +4693,7 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 	// Keep only the last 32768 decoded bytes as context for the next block.
 	// The stack buffer is reused per member/entry without accumulating
 	// allocations in the file arena. wlen <= WINDOW.
-	const WINDOW = 32768;
+	const WINDOW = common.WINDOW_SIZE;
 	var window: [WINDOW]u8 = undefined;
 	var wlen: usize = 0;
 	// Per-block scratch arena. optimizeBlock's candidate search (union driver
@@ -4675,466 +4779,6 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 	return run.joined;
 }
 
-/// Optimize a raw deflate stream; returns the re-assembled bytes in `a`.
-/// Input-size capacity is reserved up front to avoid ArrayList growth-leak in
-/// the arena. This is a reservation, not a hard allocation bound; container
-/// byte guards independently enforce the delivered file-size contract.
-pub fn optimizeDeflateBytes(a: std.mem.Allocator, in: []const u8) deflasm.ParseError![]u8 {
-	var buf: std.ArrayList(u8) = .empty;
-	try buf.ensureTotalCapacity(a, in.len);
-	try optimizeDeflateFused(a, &buf, in);
-	return buf.items;
-}
-
-/// Independently inflate both streams through std.compress.flate and
-/// compare fixed-size chunks. readSliceShort fills each chunk except at
-/// EOF, so equal streams return equal counts. Return false on inflate
-/// errors or content/length differences.
-fn inflateEql(orig: []const u8, opt: []const u8) bool {
-	const flate = std.compress.flate;
-	var in1 = std.Io.Reader.fixed(orig);
-	var win1: [flate.max_window_len]u8 = undefined;
-	var d1 = flate.Decompress.init(&in1, .raw, &win1);
-	var in2 = std.Io.Reader.fixed(opt);
-	var win2: [flate.max_window_len]u8 = undefined;
-	var d2 = flate.Decompress.init(&in2, .raw, &win2);
-	var b1: [65536]u8 = undefined;
-	var b2: [65536]u8 = undefined;
-	while (true) {
-		const n1 = d1.reader.readSliceShort(&b1) catch return false;
-		const n2 = d2.reader.readSliceShort(&b2) catch return false;
-		if (n1 != n2) return false;
-		if (n1 == 0) return true;
-		if (!std.mem.eql(u8, b1[0..n1], b2[0..n1])) return false;
-	}
-}
-
-/// Inflate a DEFLATE stream and compute CRC-32 and length without retaining
-/// the plaintext. Return false on inflate errors.
-fn inflateCrcLen(deflate: []const u8, crc_out: *u32, len_out: *u64) bool {
-	const flate = std.compress.flate;
-	var in_reader = std.Io.Reader.fixed(deflate);
-	var win: [flate.max_window_len]u8 = undefined;
-	var d = flate.Decompress.init(&in_reader, .raw, &win);
-	var buf: [65536]u8 = undefined;
-	var crc = std.hash.crc.Crc32.init();
-	var total: u64 = 0;
-	while (true) {
-		const n = d.reader.readSliceShort(&buf) catch return false;
-		if (n == 0) break;
-		crc.update(buf[0..n]);
-		total += n;
-	}
-	crc_out.* = crc.final();
-	len_out.* = total;
-	return true;
-}
-
-/// Inflate a raw DEFLATE stream and compute Adler-32 for auxiliary chunk
-/// validation. Return false on inflate errors.
-fn inflateAdler(deflate: []const u8, adler_out: *u32) bool {
-	const flate = std.compress.flate;
-	var in_reader = std.Io.Reader.fixed(deflate);
-	var win: [flate.max_window_len]u8 = undefined;
-	var d = flate.Decompress.init(&in_reader, .raw, &win);
-	var buf: [65536]u8 = undefined;
-	var adler = std.hash.Adler32{};
-	while (true) {
-		const n = d.reader.readSliceShort(&buf) catch return false;
-		if (n == 0) break;
-		adler.update(buf[0..n]);
-	}
-	adler_out.* = adler.adler;
-	return true;
-}
-
-pub fn optimizeGzip(in: []const u8, out: []u8) i64 {
-	var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-	defer arena.deinit();
-	const a = arena.allocator();
-
-	// Optimize gzip members independently, resetting history at each member.
-	// The fused loop reports consumed bytes and appends directly to the output.
-	// Reject trailing bytes that do not form another member. Preserve every
-	// header and trailer verbatim.
-	var buf: std.ArrayList(u8) = .empty;
-	buf.ensureTotalCapacity(a, in.len) catch return ERR;
-	var pos: usize = 0;
-	var n_members: usize = 0;
-	while (pos < in.len) {
-		const rem = in[pos..];
-		const hlen = deflasm.gzipHeaderLen(rem) orelse return ERR;
-
-		// BGZF: member sizes live in the 'BC' FEXTRA subfield; re-encoding
-		// would corrupt them. Pass the whole file through byte-identical.
-		if (deflasm.isBgzf(rem[0..hlen])) return emit(out, in);
-
-		buf.appendSlice(a, rem[0..hlen]) catch return ERR;
-		const start = buf.items.len;
-		var consumed: usize = undefined;
-		optimizeDeflateFusedConsumed(a, &buf, rem[hlen..], &consumed) catch return ERR;
-		if (hlen + consumed + 8 > rem.len) return ERR; // missing member trailer
-
-		// Roundtrip: optimized member must decompress to the original content.
-		if (!inflateEql(rem[hlen..][0..consumed], buf.items[start..])) return ERR;
-
-		buf.appendSlice(a, rem[hlen + consumed .. hlen + consumed + 8]) catch return ERR;
-		pos += hlen + consumed + 8;
-		n_members += 1;
-	}
-	if (n_members == 0) return ERR;
-	// Never emit a larger file.
-	if (buf.items.len > in.len) return emit(out, in);
-	return emit(out, buf.items);
-}
-
-// ── ZIP container optimizer ──────────────────────────
-
-/// Optimize a ZIP container. Each method-8 (deflate), unencrypted entry is
-/// re-encoded independently (windows are self-contained per entry); everything
-/// else — stored/other-method/encrypted entries, timestamps, extra fields,
-/// comments, ordering, inter-entry padding, SFX prefixes — is preserved
-/// VERBATIM. Zip64 and APK-signing-block archives pass through byte-identical
-/// (parse marks them passthrough). Recompression changes compressed sizes, so
-/// local-header / data-descriptor / central-directory sizes and all offsets are
-/// rewritten by assembleZipMembers.
-pub fn optimizeZip(in: []const u8, out: []u8) i64 {
-	var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-	defer arena.deinit();
-	const a = arena.allocator();
-
-	const arc = deflasm.parseZipMembers(a, in) catch return ERR;
-	if (arc.passthrough) return emit(out, in);
-
-	// Only adopted entry bytes survive in the file arena. Reset parse and
-	// search scratch at each entry, including after a skipped entry.
-	var entry_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-	defer entry_scratch.deinit();
-	for (arc.entries) |*e| {
-		if (e.method != deflasm.ZIP_METHOD_DEFLATE or (e.gp_flag & deflasm.ZIP_FLAG_ENCRYPTED) != 0) continue;
-		_ = entry_scratch.reset(SCRATCH_RESET);
-		const es = entry_scratch.allocator();
-		// Keep an entry verbatim if its DEFLATE cannot be parsed or optimized.
-		var new_buf: std.ArrayList(u8) = .empty;
-		new_buf.ensureTotalCapacity(es, e.data.len) catch continue;
-		optimizeDeflateFused(es, &new_buf, e.data) catch continue;
-		const new_data = new_buf.items;
-
-		// Require the optimized stream to inflate to the CRC-32 and length in
-		// the central directory. A mismatch rejects the output.
-		var crc: u32 = undefined;
-		var plain_len: u64 = undefined;
-		if (!inflateCrcLen(new_data, &crc, &plain_len)) return ERR;
-		if (crc != e.crc32) return ERR;
-		if (plain_len != e.uncomp_size) return ERR;
-
-		// Adopt only on strict byte reduction (tie → original encoding); the
-		// adopted bytes must outlive the scratch reset.
-		if (new_data.len < e.data.len) {
-			e.new_data = a.dupe(u8, new_data) catch return ERR;
-			e.reoptimized = true;
-		}
-	}
-
-	const result = deflasm.assembleZipMembers(a, arc) catch return ERR;
-	// Never emit a larger file.
-	if (result.len > in.len) return emit(out, in);
-	return emit(out, result);
-}
-
-// ── PNG / APNG optimizer ───────────────────
-
-const PNG_SIG = common.PNG_SIG;
-
-fn rdU32be(d: []const u8, p: usize) u32 {
-	return (@as(u32, d[p]) << 24) | (@as(u32, d[p + 1]) << 16) |
-		(@as(u32, d[p + 2]) << 8) | @as(u32, d[p + 3]);
-}
-
-fn wrU32be(v: u32) [4]u8 {
-	return .{ @intCast(v >> 24), @intCast((v >> 16) & 0xff), @intCast((v >> 8) & 0xff), @intCast(v & 0xff) };
-}
-
-const Chunk = struct { typ: []const u8, data: []const u8 };
-
-fn concat3(a: std.mem.Allocator, x: []const u8, y: []const u8, z: []const u8) ![]u8 {
-	const out = try a.alloc(u8, x.len + y.len + z.len);
-	@memcpy(out[0..x.len], x);
-	@memcpy(out[x.len .. x.len + y.len], y);
-	@memcpy(out[x.len + y.len ..], z);
-	return out;
-}
-
-/// Extract candidate DEFLATE bytes after validating the zlib header.
-/// optimizeZlibDeflate checks the stream extent and Adler-32.
-fn zlibDeflate(zlib_data: []const u8) error{Malformed}![]const u8 {
-	if (zlib_data.len < 6) return error.Malformed;
-	const cmf: u32 = zlib_data[0];
-	const flg: u32 = zlib_data[1];
-	if (cmf & 0x0F != 8 or cmf >> 4 > 7 or (cmf * 256 + flg) % 31 != 0 or
-		flg & 0x20 != 0) return error.Malformed;
-	return zlib_data[2 .. zlib_data.len - 4];
-}
-
-/// Optimize exactly one zlib stream and return its DEFLATE bytes.
-/// The fused parse/optimize pass checks the consumed extent before Adler-32
-/// validation. Zig 0.16's std.compress.flate can crash on truncated input,
-/// so it must only see streams our parser has read to the end.
-fn optimizeZlibDeflate(a: std.mem.Allocator, zlib_data: []const u8) deflasm.ParseError![]u8 {
-	const deflate = try zlibDeflate(zlib_data);
-	var buf: std.ArrayList(u8) = .empty;
-	try buf.ensureTotalCapacity(a, deflate.len);
-	var consumed: usize = undefined;
-	try optimizeDeflateFusedConsumed(a, &buf, deflate, &consumed);
-	// Trailing bytes between the final block and the adler: reject, never
-	// silently drop.
-	if (consumed != deflate.len) return error.Malformed;
-	var adler: u32 = undefined;
-	if (!inflateAdler(deflate, &adler)) return error.Malformed;
-	if (adler != rdU32be(zlib_data, zlib_data.len - 4)) return error.Malformed;
-	return buf.items;
-}
-
-/// Preserve the zlib header and trailer around optimized DEFLATE bytes.
-/// Malformed input returns an error; changed decoded output panics.
-fn optimizeZlibStream(a: std.mem.Allocator, zlib_data: []const u8) ![]u8 {
-	const opt = try optimizeZlibDeflate(a, zlib_data);
-	const deflate = zlib_data[2 .. zlib_data.len - 4];
-	if (!inflateEql(deflate, opt))
-		@panic("BUG: aux zlib roundtrip failure - decompressed content differs");
-	return concat3(a, zlib_data[0..2], opt, zlib_data[zlib_data.len - 4 ..]);
-}
-
-/// Optimize embedded zlib in zTXt, iCCP and compressed iTXt chunks.
-/// Preserve the original on parse/allocation failure; optimizer panics
-/// propagate. Reset scratch per call and retain only final chunk data.
-fn optimizeChunkData(a: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, typ: []const u8, data: []const u8) []const u8 {
-	const offset = common.pngCompressedOffset(typ, data) orelse return data;
-	const zlib_data = data[offset..];
-	if (zlib_data.len == 0) return data;
-	defer _ = scratch.reset(SCRATCH_RESET);
-	const opt = optimizeZlibStream(scratch.allocator(), zlib_data) catch return data;
-	return concat3(a, data[0..offset], opt, &.{}) catch return data;
-}
-
-test "unknown PNG auxiliary compression methods remain opaque" {
-	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-	defer arena.deinit();
-	var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
-	defer scratch.deinit();
-	// A valid stored empty zlib stream would shrink if the method were ignored.
-	var payload = [_]u8{ 'n', 0, 1, 0x78, 0x01, 0x01, 0, 0, 0xff, 0xff, 0, 0, 0, 1 };
-	for ([_][]const u8{ "zTXt", "iCCP" }) |typ| {
-		for ([_]u8{ 1, 255 }) |method| {
-			payload[2] = method;
-			try std.testing.expectEqualSlices(u8, &payload, optimizeChunkData(arena.allocator(), &scratch, typ, &payload));
-		}
-	}
-}
-
-/// Optimize auxiliary zlib streams and merge consecutive APNG fdAT chunks.
-/// Adjust fcTL/fdAT sequence numbers after merging. Reset scratch per
-/// frame; only final chunk data survives in the file arena.
-fn optimizePostIdatChunks(a: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, chunks: []const Chunk) ![]Chunk {
-	var out: std.ArrayList(Chunk) = .empty;
-	var seq_delta: u32 = 0;
-	var i: usize = 0;
-	while (i < chunks.len) {
-		const c = chunks[i];
-		if (std.mem.eql(u8, c.typ, "fcTL")) {
-			if (c.data.len < 4) return error.Malformed;
-			const seq = rdU32be(c.data, 0);
-			// Reject sequence underflow instead of wrapping to a large u32.
-			if (seq < seq_delta) return error.Malformed;
-			const nd = try concat3(a, &wrU32be(seq - seq_delta), c.data[4..], &.{});
-			try out.append(a, .{ .typ = c.typ, .data = nd });
-			i += 1;
-		} else if (std.mem.eql(u8, c.typ, "fdAT")) {
-			if (c.data.len < 4) return error.Malformed;
-			// Merge consecutive fdAT chunks for this frame.
-			const ss = scratch.allocator();
-			var zlib_data: std.ArrayList(u8) = .empty;
-			const first_seq = rdU32be(c.data, 0);
-			if (first_seq < seq_delta) return error.Malformed; // see fcTL above
-			var group_len: u32 = 0;
-			while (i < chunks.len and std.mem.eql(u8, chunks[i].typ, "fdAT")) : (i += 1) {
-				if (chunks[i].data.len < 4) return error.Malformed;
-				try zlib_data.appendSlice(ss, chunks[i].data[4..]);
-				group_len += 1;
-			}
-			const opt = optimizeZlibStream(ss, zlib_data.items) catch zlib_data.items;
-			const nd = try concat3(a, &wrU32be(first_seq - seq_delta), opt, &.{});
-			try out.append(a, .{ .typ = "fdAT", .data = nd });
-			seq_delta += group_len - 1; // merged N→1
-			_ = scratch.reset(SCRATCH_RESET);
-		} else {
-			try out.append(a, .{ .typ = c.typ, .data = optimizeChunkData(a, scratch, c.typ, c.data) });
-			i += 1;
-		}
-	}
-	return out.items;
-}
-
-test "post-IDAT APNG chunks require complete sequence fields" {
-	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-	defer arena.deinit();
-	var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
-	defer scratch.deinit();
-	const sequence = [_]u8{ 0, 0, 0, 0 };
-	for (0..4) |length| {
-		for ([_][]const u8{ "fcTL", "fdAT" }) |typ| {
-			const chunks = [_]Chunk{.{ .typ = typ, .data = sequence[0..length] }};
-			try std.testing.expectError(error.Malformed, optimizePostIdatChunks(arena.allocator(), &scratch, &chunks));
-		}
-		const chunks = [_]Chunk{
-			.{ .typ = "fdAT", .data = &sequence },
-			.{ .typ = "fdAT", .data = sequence[0..length] },
-		};
-		try std.testing.expectError(error.Malformed, optimizePostIdatChunks(arena.allocator(), &scratch, &chunks));
-	}
-}
-
-fn writePngChunk(a: std.mem.Allocator, out: *std.ArrayList(u8), typ: []const u8, data: []const u8) !void {
-	try out.appendSlice(a, &wrU32be(@intCast(data.len)));
-	try out.appendSlice(a, typ);
-	try out.appendSlice(a, data);
-	var crc = std.hash.crc.Crc32.init();
-	crc.update(typ);
-	crc.update(data);
-	try out.appendSlice(a, &wrU32be(crc.final()));
-}
-
-pub fn optimizePng(in: []const u8, out: []u8) i64 {
-	var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-	defer arena.deinit();
-	const a = arena.allocator();
-
-	if (in.len < 8 or !std.mem.eql(u8, in[0..8], &PNG_SIG)) return ERR;
-
-	var pre: std.ArrayList(Chunk) = .empty;
-	var post: std.ArrayList(Chunk) = .empty;
-	var idat: std.ArrayList(u8) = .empty;
-	var seen_idat = false;
-
-	// Require every byte after the PNG signature to belong to a valid chunk.
-	// Reject trailing garbage, oversized lengths, framing overruns, bad CRCs
-	// and nonconsecutive IDAT runs.
-	var pos: usize = 8;
-	var prev_was_idat = false;
-	while (pos < in.len) {
-		if (pos + 8 > in.len) return ERR;
-		const len: usize = @intCast(rdU32be(in, pos));
-		if (len > 0x7FFFFFFF) return ERR;
-		if (pos + 12 + len > in.len) return ERR;
-		const typ = in[pos + 4 .. pos + 8];
-		const cdata = in[pos + 8 .. pos + 8 + len];
-		var crc = std.hash.crc.Crc32.init();
-		crc.update(typ);
-		crc.update(cdata);
-		if (crc.final() != rdU32be(in, pos + 8 + len)) return ERR;
-		if (std.mem.eql(u8, typ, "IDAT")) {
-			if (seen_idat and !prev_was_idat) return ERR;
-			idat.appendSlice(a, cdata) catch return ERR;
-			seen_idat = true;
-			prev_was_idat = true;
-		} else if (!seen_idat) {
-			pre.append(a, .{ .typ = typ, .data = cdata }) catch return ERR;
-			prev_was_idat = false;
-		} else {
-			post.append(a, .{ .typ = typ, .data = cdata }) catch return ERR;
-			prev_was_idat = false;
-		}
-		pos += 12 + len;
-	}
-	if (idat.items.len < 6) return ERR;
-
-	// IDAT must be exactly one zlib stream; refuse trailing data rather than discard it.
-	const zlib_header = idat.items[0..2];
-	const adler = idat.items[idat.items.len - 4 ..];
-	const deflate = idat.items[2 .. idat.items.len - 4];
-
-	// The fused core retains only the assembled stream in the file arena.
-	// Scratch below serves auxiliary embedded streams.
-	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-	defer scratch.deinit();
-	const opt_deflate = optimizeZlibDeflate(a, idat.items) catch return ERR;
-
-	// Roundtrip: optimized IDAT must decompress to the original content.
-	if (!inflateEql(deflate, opt_deflate)) return ERR;
-
-	// Optimize auxiliary chunks.
-	const new_pre = a.alloc(Chunk, pre.items.len) catch return ERR;
-	for (pre.items, 0..) |c, i| new_pre[i] = .{ .typ = c.typ, .data = optimizeChunkData(a, &scratch, c.typ, c.data) };
-	const new_post = optimizePostIdatChunks(a, &scratch, post.items) catch return ERR;
-
-	// Assemble.
-	var buf: std.ArrayList(u8) = .empty;
-	buf.appendSlice(a, &PNG_SIG) catch return ERR;
-	for (new_pre) |c| writePngChunk(a, &buf, c.typ, c.data) catch return ERR;
-	const new_idat = concat3(a, zlib_header, opt_deflate, adler) catch return ERR;
-	writePngChunk(a, &buf, "IDAT", new_idat) catch return ERR;
-	for (new_post) |c| writePngChunk(a, &buf, c.typ, c.data) catch return ERR;
-	// Never emit a larger file.
-	if (buf.items.len > in.len) return emit(out, in);
-	return emit(out, buf.items);
-}
-
-test "PNG: truncated zlib streams are refused or kept before std.compress.flate reads them" {
-	// Fuzz-minimized: std.compress.flate (Zig 0.16) fails an assertion on the
-	// first stream and overflows on the second, both truncated mid-token. As
-	// IDAT they must be refused; as zTXt kept verbatim.
-	const truncated = [_][]const u8{
-		&.{
-			0x78, 0xda, 0xbd, 0xd3, 0xc5, 0x42, 0x10, 0x48, 0x00, 0x00, 0xd0, 0x01,
-			0x24, 0xa4, 0x94, 0x6e, 0x44, 0x45, 0x94, 0xee, 0x0e, 0x09, 0x05, 0x25,
-			0x45, 0x51, 0x41, 0xba, 0xbb, 0xbb, 0x95, 0x06, 0x95, 0x52, 0x29, 0x51,
-			0x40, 0x09, 0x09, 0x30, 0x14, 0x69, 0x04, 0x94, 0xee, 0xee, 0xee, 0xee,
-			0xae, 0xbd, 0xcd, 0x65, 0xef, 0x73, 0x7b, 0x3f, 0xf0, 0x00, 0xff, 0x30,
-			0xff, 0x30, 0x30, 0x30, 0x30,
-		},
-		&.{
-			0x78, 0xda, 0xed, 0xda, 0x01, 0x66, 0xc6, 0x40, 0x10, 0x86, 0xe1, 0xf7,
-			0x37, 0x30, 0x30, 0x30,
-		},
-	};
-	// 1x1 grayscale; the IDAT stream is one stored block holding [0, 0].
-	const ihdr = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0 };
-	const idat = [_]u8{ 0x78, 0x01, 0x01, 0x02, 0x00, 0xfd, 0xff, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01 };
-	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-	defer arena.deinit();
-	const a = arena.allocator();
-	var out: [4096]u8 = undefined;
-	for ([_]bool{ true, false }) |reparse_on| {
-		const previous = swapReparse(reparse_on);
-		defer _ = swapReparse(previous);
-		for (truncated) |z| {
-			var bad: std.ArrayList(u8) = .empty;
-			try bad.appendSlice(a, &PNG_SIG);
-			try writePngChunk(a, &bad, "IHDR", &ihdr);
-			try writePngChunk(a, &bad, "IDAT", z);
-			try writePngChunk(a, &bad, "IEND", "");
-			try std.testing.expectEqual(ERR, optimizePng(bad.items, &out));
-
-			var ztxt: std.ArrayList(u8) = .empty;
-			try writePngChunk(a, &ztxt, "zTXt", try std.mem.concat(a, u8, &.{ "Comment\x00\x00", z }));
-			var aux: std.ArrayList(u8) = .empty;
-			try aux.appendSlice(a, &PNG_SIG);
-			try writePngChunk(a, &aux, "IHDR", &ihdr);
-			try aux.appendSlice(a, ztxt.items);
-			try writePngChunk(a, &aux, "IDAT", &idat);
-			try writePngChunk(a, &aux, "IEND", "");
-			const n = optimizePng(aux.items, &out);
-			try std.testing.expect(n >= 0 and n <= aux.items.len);
-			try std.testing.expect(std.mem.indexOf(u8, out[0..@intCast(n)], ztxt.items) != null);
-		}
-	}
-}
-
-fn emit(out: []u8, src: []const u8) i64 {
-	if (src.len <= out.len) @memcpy(out[0..src.len], src);
-	return @intCast(src.len);
-}
-
 test "stored region costs match assembly at every offset and chunk limit" {
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
@@ -5191,7 +4835,7 @@ test "native encoding metadata survives valid edits and falls back after incompa
 	const blocks = try deflasm.parseDeflate(a, "\x73\x1c\xf9\x00\x00");
 	var b = blocks[0];
 	try std.testing.expect(b.body.huff.tokens[1].match.original_alt258);
-	const ordinary = [_]Token{ .{ .lit = 65 }, .{ .match = .{ .length = 258, .distance = 1 } } };
+	const ordinary = [_]Token{ .{ .lit = 65 }, .{ .match = .{ .length = common.MAX_MATCH_LENGTH, .distance = 1 } } };
 	try std.testing.expect(tokensEqual(b.body.huff.tokens, &ordinary));
 	var out: std.ArrayList(u8) = .empty;
 	// Constructing a new block around parsed tokens reconstructs normally.
@@ -5207,7 +4851,7 @@ test "native encoding metadata survives valid edits and falls back after incompa
 	try std.testing.expectEqual(@as(u16, 3), edited[0].body.huff.tokens[1].match.length);
 	// A new tree with no 284 invalidates the old preference even when the
 	// parsed context is deliberately retained; cost and output must agree.
-	changed_tokens[1].match.length = 258;
+	changed_tokens[1].match.length = common.MAX_MATCH_LENGTH;
 	var rebuilt = try makeDynamicBlock(a, b.body.huff.tokens, true, false, false);
 	rebuilt.body.huff.encoding = b.body.huff.encoding;
 	try std.testing.expectEqual(@as(u8, 0), rebuilt.body.huff.ll_lengths[284]);
@@ -5243,4 +4887,167 @@ test "native encoding metadata survives valid edits and falls back after incompa
 	out.clearRetainingCapacity();
 	try deflasm.assembleDeflate(a, &out, &.{last});
 	try std.testing.expectEqualSlices(u8, changed, out.items);
+}
+
+/// Options are scoped to this call, including nested research calls.
+pub const Options = struct {
+	reparse: bool = true,
+	min_dist_codes: u8 = 2,
+	explore_read: ExploreRead = .{},
+	feedback_policy: FeedbackPolicy = .{},
+	feedback_session: ?*FeedbackSession = null,
+	memo: ?*OptimizerMemo = null,
+};
+
+/// Snapshot the legacy research scope for callers migrating from swap* APIs.
+pub fn currentOptions() Options {
+	return .{ .reparse = reparse_enabled, .min_dist_codes = min_dist_codes,
+		.explore_read = explore_read, .feedback_policy = feedback_policy,
+		.feedback_session = feedback_session, .memo = active_optimizer_memo };
+}
+
+fn setOptions(options: Options) void {
+	std.debug.assert(options.min_dist_codes <= 2);
+	reparse_enabled = options.reparse;
+	min_dist_codes = options.min_dist_codes;
+	explore_read = options.explore_read;
+	feedback_policy = options.feedback_policy;
+	feedback_session = options.feedback_session;
+	active_optimizer_memo = options.memo;
+}
+
+pub const Checksum = enum { none, crc32, adler32 };
+pub const Result = struct {
+	/// End of the first stream, rounded up to a byte. Any suffix is untouched.
+	consumed: usize,
+	decoded_size: u64,
+	/// Zero for .none; otherwise the requested checksum of decoded bytes.
+	checksum: u32,
+};
+pub const StreamError = deflasm.ParseError || error{VerificationFailed};
+
+/// Append one optimized stream and independently verify decoded equality.
+/// `in` must not alias `out`. On error, restore the output's original length.
+/// Only encoded output lives in `a`; parse/search scratch is recycled per block
+/// and verification uses fixed-size windows. No container or file-size policy.
+pub fn optimize(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, options: Options, checksum: Checksum) StreamError!Result {
+	const previous = currentOptions();
+	setOptions(options);
+	defer setOptions(previous);
+	const start = out.items.len;
+	errdefer out.shrinkRetainingCapacity(start);
+	var consumed: usize = undefined;
+	try optimizeDeflateFusedConsumed(a, out, in, &consumed);
+	std.debug.assert(consumed <= in.len);
+	return verify(in[0..consumed], out.items[start..], checksum);
+}
+
+/// Inspect one stream without optimizing it. Parse before invoking the
+/// independent inflater, which assumes complete input. Used for opaque BGZF.
+pub fn inspect(a: std.mem.Allocator, in: []const u8, checksum: Checksum) StreamError!Result {
+	var scratch = std.heap.ArenaAllocator.init(a);
+	defer scratch.deinit();
+	var consumed: usize = undefined;
+	_ = try deflasm.parseDeflateConsumed(scratch.allocator(), in, &consumed);
+	return verify(in[0..consumed], null, checksum);
+}
+
+/// Bit-exact parse/assembly of one stream, reporting its consumed extent.
+pub fn roundtrip(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8) deflasm.ParseError!usize {
+	const start = out.items.len;
+	errdefer out.shrinkRetainingCapacity(start);
+	var scratch = std.heap.ArenaAllocator.init(a);
+	defer scratch.deinit();
+	var consumed: usize = undefined;
+	const blocks = try deflasm.parseDeflateConsumed(scratch.allocator(), in, &consumed);
+	try deflasm.assembleDeflate(a, out, blocks);
+	return consumed;
+}
+
+/// Parsed input is required: Zig's independent inflater is not a safe parser
+/// for arbitrary truncated streams. Collect integrity during the equality pass.
+fn verify(orig: []const u8, opt: ?[]const u8, checksum: Checksum) StreamError!Result {
+	const flate = std.compress.flate;
+	var in1 = std.Io.Reader.fixed(orig);
+	var win1: [flate.max_window_len]u8 = undefined;
+	var d1 = flate.Decompress.init(&in1, .raw, &win1);
+	var in2 = std.Io.Reader.fixed(opt orelse &.{});
+	var win2: [flate.max_window_len]u8 = undefined;
+	var d2 = flate.Decompress.init(&in2, .raw, &win2);
+	var b1: [65536]u8 = undefined;
+	var b2: [65536]u8 = undefined;
+	var crc = std.hash.crc.Crc32.init();
+	var adler = std.hash.Adler32{};
+	var length: u64 = 0;
+	while (true) {
+		const n1 = d1.reader.readSliceShort(&b1) catch return error.Malformed;
+		if (opt != null) {
+			const n2 = d2.reader.readSliceShort(&b2) catch return error.VerificationFailed;
+			if (n1 != n2 or !std.mem.eql(u8, b1[0..n1], b2[0..n2])) return error.VerificationFailed;
+		}
+		if (n1 == 0) break;
+		switch (checksum) {
+			.none => {},
+			.crc32 => crc.update(b1[0..n1]),
+			.adler32 => adler.update(b1[0..n1]),
+		}
+		length += n1;
+	}
+	return .{ .consumed = orig.len, .decoded_size = length,
+		.checksum = switch (checksum) { .none => 0, .crc32 => crc.final(), .adler32 => adler.adler } };
+}
+
+fn optimizeDeflateBytes(a: std.mem.Allocator, in: []const u8) StreamError![]u8 {
+	var out: std.ArrayList(u8) = .empty;
+	_ = try optimize(a, &out, in, currentOptions(), .none);
+	return out.items;
+}
+
+fn inflateEql(orig: []const u8, opt: []const u8) bool {
+	_ = verify(orig, opt, .none) catch return false;
+	return true;
+}
+
+test "stream interface owns extent, integrity, rollback and option scope" {
+	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const input = [_]u8{ 1, 3, 0, 0xfc, 0xff, 'a', 'b', 'c', 0xde, 0xad };
+	const previous = currentOptions();
+	for ([_]bool{ true, false }) |reparse_on| {
+		for (0..3) |floor| {
+			for ([_]Checksum{ .none, .crc32, .adler32 }) |checksum| {
+				var out: std.ArrayList(u8) = .empty;
+				try out.appendSlice(a, "prefix");
+				const result = try optimize(a, &out, &input, .{
+					.reparse = reparse_on, .min_dist_codes = @intCast(floor),
+				}, checksum);
+				try std.testing.expectEqual(8, result.consumed);
+				try std.testing.expectEqual(3, result.decoded_size);
+				try std.testing.expectEqual(@as(u32, switch (checksum) {
+					.none => 0, .crc32 => std.hash.crc.Crc32.hash("abc"), .adler32 => 0x024d0127,
+				}), result.checksum);
+				try std.testing.expectEqualSlices(u8, "prefix", out.items[0..6]);
+				try std.testing.expectEqualDeep(previous, currentOptions());
+			}
+		}
+	}
+	var out: std.ArrayList(u8) = .empty;
+	try out.appendSlice(a, "prefix");
+	const malformed = [_]u8{ 0, 1, 0, 0xfe, 0xff, 'a', 7 };
+	try std.testing.expectError(error.Malformed, optimize(a, &out, &malformed, .{ .reparse = false, .min_dist_codes = 0 }, .none));
+	try std.testing.expectEqualSlices(u8, "prefix", out.items);
+	try std.testing.expectEqualDeep(previous, currentOptions());
+	try std.testing.expectEqual(8, try roundtrip(a, &out, &input));
+	try std.testing.expectEqualSlices(u8, input[0..8], out.items[6..]);
+	const info = try inspect(a, &input, .crc32);
+	try std.testing.expectEqual(8, info.consumed);
+	try std.testing.expectEqual(3, info.decoded_size);
+	try std.testing.expectEqual(std.hash.crc.Crc32.hash("abc"), info.checksum);
+}
+
+test "stream verifier refuses changed output" {
+	const good = [_]u8{ 1, 3, 0, 0xfc, 0xff, 'a', 'b', 'c' };
+	const changed = [_]u8{ 1, 3, 0, 0xfc, 0xff, 'a', 'b', 'd' };
+	try std.testing.expectError(error.VerificationFailed, verify(&good, &changed, .crc32));
 }

@@ -9,11 +9,14 @@ const A = std.mem.Allocator;
 const Token = deflasm.Token;
 fn ensure(ok: bool) void { if (!ok) @panic("deferred search invariant violated"); }
 
+pub const MAX_QUERY_LENGTH = 4096;
+pub const DEFAULT_HEAP_ENTRIES = 262144;
+
 pub const Stats = struct {
 	queries: usize = 0, shared_queries: usize = 0,
 	initialized_positions: usize = 0, packed_answers: usize = 0,
 	heap_entries: usize = 0, root_answers: usize = 0,
-	max_heap_entries: usize = 262144,
+	max_heap_entries: usize = DEFAULT_HEAP_ENTRIES,
 	limited: bool = false,
 };
 
@@ -58,7 +61,7 @@ pub const Query = struct {
 	costs: []f64, items: []Item, stats: *Stats,
 
 	pub fn init(a: A, edges: reparse.Edges, start: usize, length: usize, mask: ir.SymbolMask, prices: reparse.Prices, stats: *Stats) !Query {
-		ensure(length > 0 and length <= 4096 and start + length <= edges.program.raw().len);
+		ensure(length > 0 and length <= MAX_QUERY_LENGTH and start + length <= edges.program.raw().len);
 		for (prices.ll) |p| ensure(std.math.isFinite(p));
 		for (prices.dist) |p| ensure(std.math.isFinite(p));
 		const costs = try a.alloc(f64, length + 1);
@@ -242,7 +245,7 @@ fn enumerateForTest(a: A, q: *const Query, pos: usize, tokens: *std.ArrayList(To
 		const limit = @min(e.length, q.length - pos);
 		if (limit < 3) continue;
 		for (3..limit + 1) |n| {
-			if (q.mask & (@as(u64, 1) << @intCast(32 + common.lenCodeTable[n].code - 257)) != 0) continue;
+			if (q.mask & (@as(u64, 1) << @intCast(ir.LENGTH_MASK_SHIFT + common.lenCodeTable[n].code - common.FIRST_LENGTH_SYMBOL)) != 0) continue;
 			try tokens.append(a, .{ .match = .{ .length = @intCast(n), .distance = e.distance } });
 			try enumerateForTest(a, q, pos + n, tokens, out, cost + q.tokenCost(pos, .{ .length = @intCast(n), .distance = e.distance }));
 			_ = tokens.pop();

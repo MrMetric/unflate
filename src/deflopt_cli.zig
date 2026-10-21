@@ -1,4 +1,4 @@
-//! Linux CLI for gzip, PNG and ZIP optimization.
+//! Linux CLI for raw DEFLATE, gzip, PNG and ZIP optimization.
 //!
 //! FILE arguments are rewritten in place with a durable sibling backup.
 //! -r walks directories and selects files by signature. -i/-o selects pair
@@ -11,8 +11,7 @@ const std = @import("std");
 const Args = @import("cli_args.zig").Args;
 const linux = std.os.linux;
 const deflopt = @import("deflopt.zig");
-const deflasm = @import("deflasm.zig");
-const common = @import("deflcommon.zig");
+const containers = @import("containers.zig");
 
 const BAK_SUFFIX = ".unflate-bak";
 const AT_FDCWD = linux.AT.FDCWD;
@@ -54,6 +53,10 @@ fn fdPrint(fd: i32, comptime fmt: []const u8, args: anytype) void {
 fn readWholeFile(alloc: std.mem.Allocator, pz: [*:0]const u8) ![]u8 {
 	const fd = try sysOpen(pz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
 	defer _ = linux.close(fd);
+	return readAllFd(alloc, fd);
+}
+
+fn readAllFd(alloc: std.mem.Allocator, fd: i32) ![]u8 {
 	var data: std.ArrayList(u8) = .empty;
 	var chunk: [1 << 16]u8 = undefined;
 	while (true) {
@@ -90,63 +93,33 @@ fn isatty(fd: i32) bool {
 
 // ── format detection ─────────────────────────
 
-const Kind = enum {
-	png,
-	gzip,
-	zip,
+const Kind = containers.Format;
+var format_override: ?Kind = null;
+var options: containers.Options = .{}; // Set before workers start; read-only thereafter.
+var report_format = false;
 
-	fn name(k: Kind) []const u8 {
-		return switch (k) {
-			.png => "png",
-			.gzip => "gzip",
-			.zip => "zip",
-		};
-	}
-};
-
-fn detect(data: []const u8) ?Kind {
-	if (data.len >= 8 and std.mem.eql(u8, data[0..8], &common.PNG_SIG)) return .png;
-	if (data.len >= 2 and data[0] == 0x1f and data[1] == 0x8b) return .gzip;
-	if (data.len >= 4) {
-		const h = data[0..4];
-		if (std.mem.eql(u8, h, &deflasm.ZIP_LFH_SIG) or
-			std.mem.eql(u8, h, &deflasm.ZIP_EOCD_SIG) or
-			std.mem.eql(u8, h, &deflasm.ZIP_CDH_SIG) or
-			deflasm.looksLikeZip(data)) return .zip;
-	}
-	return null;
+fn selectFormat(data: []const u8) ?Kind {
+	const detected = detect(data);
+	if (report_format) fdPrint(2, "format: {s}\n", .{if (detected) |k| @tagName(k) else "unknown"});
+	return format_override orelse detected;
 }
 
-/// Recognize recursive targets from their initial signature. SFX ZIP
-/// detection needs the full file and is limited to explicit inputs.
-fn sniffHead(head: []const u8) bool {
-	if (head.len >= 8 and std.mem.eql(u8, head[0..8], &common.PNG_SIG)) return true;
-	if (head.len >= 2 and head[0] == 0x1f and head[1] == 0x8b) return true;
-	if (head.len >= 4 and (std.mem.eql(u8, head[0..4], &deflasm.ZIP_LFH_SIG) or
-		std.mem.eql(u8, head[0..4], &deflasm.ZIP_EOCD_SIG) or
-		std.mem.eql(u8, head[0..4], &deflasm.ZIP_CDH_SIG))) return true;
-	return false;
+const detect = containers.detect;
+fn sniffHead(head: []const u8) bool { return containers.sniff(head) != null; }
+
+var explore_stats_wanted: bool = false;
+
+fn optimizeBytes(alloc: std.mem.Allocator, kind: Kind, data: []const u8, source: []const u8) ![]const u8 {
+	defer if (explore_stats_wanted) printExploreStats(source);
+	return containers.optimize(alloc, kind, data, options);
 }
 
-var fast_mode: bool = false; // Set before launching workers; read-only thereafter.
-var min_dist_codes_cfg: u8 = 2; // Set before launching workers.
-
-fn optimizeBytes(alloc: std.mem.Allocator, kind: Kind, data: []const u8) ![]u8 {
-	// Container optimizers never grow files, so an input-sized buffer suffices.
-	const previous = deflopt.swapReparse(!fast_mode);
-	defer _ = deflopt.swapReparse(previous);
-	const previous_floor = deflopt.swapMinDistCodes(min_dist_codes_cfg);
-	defer _ = deflopt.swapMinDistCodes(previous_floor);
-	const out = try alloc.alloc(u8, data.len);
-	const ret = switch (kind) {
-		.png => deflopt.optimizePng(data, out),
-		.gzip => deflopt.optimizeGzip(data, out),
-		.zip => deflopt.optimizeZip(data, out),
+fn optimizeError(e: anyerror) []const u8 {
+	return switch (e) {
+		error.UnsafePngChunk => "UnsafePngChunk: rewriting IDAT requires --discard-unsafe-chunks (removes metadata)",
+		error.UnknownCriticalPngChunk => "UnknownCriticalPngChunk: cannot safely interpret this PNG",
+		else => @errorName(e),
 	};
-	if (ret < 0) return error.OptimizeFailed;
-	const n: usize = @intCast(ret);
-	if (n > out.len) return error.OptimizeFailed;
-	return out[0..n];
 }
 
 // ── in-place write ───────────────────
@@ -193,7 +166,7 @@ fn copyXattrs(alloc: std.mem.Allocator, source: i32, backup: i32) !void {
 /// refuses the operation. The rewritten inode itself is not fsynced.
 fn writeInplace(alloc: std.mem.Allocator, path: []const u8, data: []const u8, original: []const u8, stx: linux.Statx) !void {
 	const pz = try pathZ(alloc, path);
-	const bakz = try alloc.dupeZ(u8, try std.mem.concat(alloc, u8, &.{ path, BAK_SUFFIX }));
+	const bakz = try std.mem.concatWithSentinel(alloc, u8, &.{ path, BAK_SUFFIX }, 0);
 	const times = [2]linux.timespec{
 		.{ .sec = stx.atime.sec, .nsec = stx.atime.nsec },
 		.{ .sec = stx.mtime.sec, .nsec = stx.mtime.nsec },
@@ -267,15 +240,15 @@ fn processOne(alloc: std.mem.Allocator, path: []const u8) Result {
 		return .{ .status = .err, .msg = @errorName(e) };
 	const data = readWholeFile(alloc, pz) catch |e|
 		return .{ .status = .err, .msg = @errorName(e) };
-	const kind = detect(data) orelse
+	const kind = selectFormat(data) orelse
 		return .{ .status = .skip, .insize = data.len, .outsize = data.len, .msg = "not PNG/gzip/zip" };
-	const out = optimizeBytes(alloc, kind, data) catch |e|
-		return .{ .status = .err, .msg = @errorName(e) };
-	if (out.len >= data.len)
-		return .{ .status = .nogain, .insize = data.len, .outsize = data.len, .msg = kind.name() };
+	const out = optimizeBytes(alloc, kind, data, path) catch |e|
+		return .{ .status = .err, .msg = optimizeError(e) };
+	if (!options.allow_growth and out.len >= data.len)
+		return .{ .status = .nogain, .insize = data.len, .outsize = data.len, .msg = @tagName(kind) };
 	writeInplace(alloc, path, out, data, stx) catch |e|
 		return .{ .status = .err, .msg = @errorName(e) };
-	return .{ .status = .opt, .insize = data.len, .outsize = out.len, .msg = kind.name() };
+	return .{ .status = .opt, .insize = data.len, .outsize = out.len, .msg = @tagName(kind) };
 }
 
 // ── target collection ───────────────────────────
@@ -365,7 +338,7 @@ fn collectTargets(
 				};
 				const hn = sysErr(linux.read(fdr, &head, head.len)) catch 0;
 				_ = linux.close(fdr);
-				if (sniffHead(head[0..hn])) {
+				if (format_override != null or sniffHead(head[0..hn])) {
 					try addTarget(alloc, &seen, targets, p);
 				} else {
 					sniffed_out.* += 1;
@@ -401,15 +374,15 @@ const BatchCtx = struct {
 	n_nogain: std.atomic.Value(usize) = .init(0),
 	n_skip: std.atomic.Value(usize) = .init(0),
 	n_err: std.atomic.Value(usize) = .init(0),
-	saved: std.atomic.Value(usize) = .init(0),
+	saved: std.atomic.Value(i64) = .init(0),
 };
 
 fn report(ctx: *BatchCtx, path: []const u8, r: Result) void {
 	switch (r.status) {
 		.opt => {
 			_ = ctx.n_opt.fetchAdd(1, .monotonic);
-			_ = ctx.saved.fetchAdd(r.insize - r.outsize, .monotonic);
-			fdPrint(1, "{s}: {d} B -> {d} B (-{d} B, {s})\n", .{ path, r.insize, r.outsize, r.insize - r.outsize, r.msg });
+			_ = ctx.saved.fetchAdd(@as(i64, @intCast(r.insize)) - @as(i64, @intCast(r.outsize)), .monotonic);
+			fdPrint(1, "{s}: {d} B -> {d} B (saved {d} B, {s})\n", .{ path, r.insize, r.outsize, @as(i64, @intCast(r.insize)) - @as(i64, @intCast(r.outsize)), r.msg });
 		},
 		.err => {
 			_ = ctx.n_err.fetchAdd(1, .monotonic);
@@ -479,11 +452,11 @@ fn runPair(alloc: std.mem.Allocator, in_path: []const u8, out_path: []const u8, 
 	const iz = pathZ(alloc, in_path) catch usageExit("error: out of memory", .{});
 	const ist = statxAt(iz) catch |e| usageExit("error: {s}: {s}", .{ in_path, @errorName(e) });
 	const data = readWholeFile(alloc, iz) catch usageExit("error: cannot read: {s}", .{in_path});
-	const kind = detect(data) orelse usageExit("error: {s}: not PNG/gzip/zip", .{in_path});
-	const out = optimizeBytes(alloc, kind, data) catch |e|
-		usageExit("error: {s}: {s}", .{ in_path, @errorName(e) });
-	if (out.len >= data.len and !stream) {
-		fdPrint(1, "{s}: already optimal ({d} B, {s}) — no output written\n", .{ in_path, data.len, kind.name() });
+	const kind = selectFormat(data) orelse usageExit("error: {s}: not PNG/gzip/zip", .{in_path});
+	const out = optimizeBytes(alloc, kind, data, in_path) catch |e|
+		usageExit("error: {s}: {s}", .{ in_path, optimizeError(e) });
+	if (!options.allow_growth and out.len >= data.len and !stream) {
+		fdPrint(1, "{s}: already optimal ({d} B, {s}) — no output written\n", .{ in_path, data.len, @tagName(kind) });
 		return 0;
 	}
 	{
@@ -499,26 +472,30 @@ fn runPair(alloc: std.mem.Allocator, in_path: []const u8, out_path: []const u8, 
 		.{ .sec = ist.mtime.sec, .nsec = ist.mtime.nsec },
 	};
 	if (!stream) _ = linux.utimensat(AT_FDCWD, oz, &times, 0);
-	fdPrint(1, "{s}: {d} B -> {d} B (-{d} B, {s}) -> {s}\n", .{ in_path, data.len, out.len, data.len - out.len, kind.name(), out_path });
+	fdPrint(1, "{s}: {d} B -> {d} B (saved {d} B, {s}) -> {s}\n", .{ in_path, data.len, out.len, @as(i64, @intCast(data.len)) - @as(i64, @intCast(out.len)), @tagName(kind), out_path });
 	return 0;
+}
+
+/// Drain this input's counters on the thread that performed its optimization.
+fn printExploreStats(source: []const u8) void {
+	const s = deflopt.takeExploreStats();
+	fdPrint(2, "explore-stats reads={d}/{d}/{d} hits={d}/{d}/{d} confirms={d} confirm_gains={d} rounds={d} full_ties={d} agree_single={d} disagree_single={d} agree_assemble={d} disagree_assemble={d} input={s}\n", .{
+		s.reads[0], s.reads[1], s.reads[2], s.hits[0], s.hits[1], s.hits[2], s.confirms, s.confirm_gains, s.rounds, s.full_ties,
+		s.agree[1], s.disagree[1], s.agree[2], s.disagree[2], source,
+	});
 }
 
 // ── filter mode ─────────────────────────────────────────────────────────────
 
 fn runFilter(alloc: std.mem.Allocator) u8 {
-	var data: std.ArrayList(u8) = .empty;
-	var chunk: [1 << 16]u8 = undefined;
-	while (true) {
-		const n = sysErr(linux.read(0, &chunk, chunk.len)) catch |e| {
+	const data = readAllFd(alloc, 0) catch |e| {
+		if (e != error.OutOfMemory)
 			fdPrint(2, "error: reading stdin: {s}\n", .{@errorName(e)});
-			return 1;
-		};
-		if (n == 0) break;
-		data.appendSlice(alloc, chunk[0..n]) catch return 1;
-	}
-	const kind = detect(data.items) orelse usageExit("error: stdin is not PNG/gzip/zip", .{});
-	const out = optimizeBytes(alloc, kind, data.items) catch |e|
-		usageExit("error: {s}", .{@errorName(e)});
+		return 1;
+	};
+	const kind = selectFormat(data) orelse usageExit("error: stdin is not PNG/gzip/zip", .{});
+	const out = optimizeBytes(alloc, kind, data, "<stdin>") catch |e|
+		usageExit("error: {s}", .{optimizeError(e)});
 	writeAllFd(1, out) catch return 1;
 	return 0;
 }
@@ -533,7 +510,7 @@ const HELP =
 	\\Losslessly shrink DEFLATE streams in PNG/gzip/zip files using
 	\\re-encoding and bounded reparsing. Files are rewritten in place
 	\\(into the inode, crash backup alongside) and left untouched when there
-	\\is no byte gain.
+	\\is no byte gain, unless --allow-growth is specified.
 	\\
 	\\  -r, --recursive   recurse into directory arguments
 	\\  -i, --input IN    explicit input (pair mode, with -o)
@@ -541,11 +518,23 @@ const HELP =
 	\\  -y                overwrite an existing output file (pair mode)
 	\\  -j, --jobs N      worker threads (default: half the cores)
 	\\  -v, --verbose     also print already-optimal and skipped files
+	\\  --format TYPE     auto (default), deflate, gzip, png or zip
+	\\  --allow-growth    write results even without byte savings (default: off)
+	\\  --discard-unsafe-chunks  omit unknown unsafe PNG chunks when needed (default: off)
+	\\  --report-format   report automatically detected type on stderr
 	\\  --fast            skip LZ77 reparsing; retain tree/token re-encoding
 	\\  --min-dist-codes N  distance codewords every rebuilt tree must carry:
 	\\                    2 (default) complete trees, readable by every decoder
 	\\                    1 single 1-bit code allowed (zlib >= 1.2.2)
 	\\                    0 max-optimal; Windows Explorer rejects some outputs
+	\\  --explore-read G  candidate evaluation: full|single|assemble (default: full)
+	\\  --feedback-read G completion evaluation (default: as --explore-read)
+	\\  --feedback-order O completion order: creation|assembled|mixed (default: creation)
+	\\  --cheap-contexts  use single-pass results to seed further searches (default: off)
+	\\  --confirm-margin N  fully evaluate candidates within N bits of the best (default: 0)
+	\\  --confirm-winner  fully evaluate each reparse round winner (default: off)
+	\\  --explore-stats   print per-input evaluation counters to stderr (default: off)
+	\\  --measure-agreement  compare cheaper evaluations against full (default: off)
 	\\  --version         print native build identity and exit
 	\\  -h, --help        this help
 	\\  --                treat remaining arguments as filenames
@@ -583,11 +572,41 @@ pub fn main(init: std.process.Init.Minimal) !void {
 			overwrite = true;
 		} else if (args.flag("-v") or args.flag("--verbose")) {
 			verbose = true;
+		} else if (args.flag("--allow-growth")) {
+			options.allow_growth = true;
+		} else if (args.flag("--discard-unsafe-chunks")) {
+			options.discard_unsafe_chunks = true;
+		} else if (args.flag("--report-format")) {
+			report_format = true;
+		} else if (option(&args, "--format", "")) |value| {
+			format_override = if (std.mem.eql(u8, value, "auto")) null else
+				std.meta.stringToEnum(Kind, value) orelse usageExit("error: --format expects auto|deflate|gzip|png|zip", .{});
 		} else if (args.flag("--fast")) {
-			fast_mode = true;
+			options.stream.reparse = false;
 		} else if (option(&args, "--min-dist-codes", "")) |value| {
-			min_dist_codes_cfg = std.fmt.parseInt(u8, value, 10) catch 255;
-			if (min_dist_codes_cfg > 2) usageExit("error: --min-dist-codes expects 0, 1 or 2, got {s}", .{value});
+			options.stream.min_dist_codes = std.fmt.parseInt(u8, value, 10) catch 255;
+			if (options.stream.min_dist_codes > 2) usageExit("error: --min-dist-codes expects 0, 1 or 2, got {s}", .{value});
+		} else if (option(&args, "--explore-read", "")) |value| {
+			options.stream.explore_read.grade = std.meta.stringToEnum(deflopt.ExploreRead.Grade, value) orelse
+				usageExit("error: --explore-read expects full|single|assemble, got {s}", .{value});
+		} else if (option(&args, "--feedback-read", "")) |value| {
+			options.stream.explore_read.feedback_grade = std.meta.stringToEnum(deflopt.ExploreRead.Grade, value) orelse
+				usageExit("error: --feedback-read expects full|single|assemble, got {s}", .{value});
+		} else if (option(&args, "--feedback-order", "")) |value| {
+			options.stream.feedback_policy.order = std.meta.stringToEnum(deflopt.FeedbackOrder, value) orelse
+				usageExit("error: --feedback-order expects creation|assembled|mixed, got {s}", .{value});
+		} else if (args.flag("--cheap-contexts")) {
+			options.stream.feedback_policy.cheap_contexts = true;
+		} else if (option(&args, "--confirm-margin", "")) |value| {
+			options.stream.explore_read.margin = std.fmt.parseInt(i64, value, 10) catch
+				usageExit("error: --confirm-margin expects an integer, got {s}", .{value});
+		} else if (args.flag("--confirm-winner")) {
+			options.stream.explore_read.winner_always = true;
+		} else if (args.flag("--explore-stats")) {
+			explore_stats_wanted = true;
+		} else if (args.flag("--measure-agreement")) {
+			explore_stats_wanted = true;
+			options.stream.explore_read.measure_agreement = true;
 		} else if (args.flag("--version")) {
 			fdPrint(1, "{s}", .{@import("deflversion.zig").text});
 			return;

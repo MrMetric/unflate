@@ -16,29 +16,14 @@ pub const DIST_EXTRA = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7,
 // HCLEN permutation order
 pub const HCLEN_ORDER = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 
-pub const PNG_SIG = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
-
 pub const ERR: i64 = -1;
 pub const MAX_SYMS = 288; // literal/length alphabet upper bound
+pub const EOB = 256;
+pub const FIRST_LENGTH_SYMBOL = 257;
+pub const MAX_MATCH_LENGTH = 258;
+pub const WINDOW_SIZE = 32768;
 
-/// Offset of a supported compressed PNG auxiliary payload. All preceding
-/// fields are metadata and must survive byte-for-byte. Uncompressed iTXt,
-/// unknown methods/types and truncated prefixes have no optimizable stream.
-pub fn pngCompressedOffset(typ: []const u8, data: []const u8) ?usize {
-	const international = std.mem.eql(u8, typ, "iTXt");
-	if (!international and !std.mem.eql(u8, typ, "zTXt") and !std.mem.eql(u8, typ, "iCCP")) return null;
-	const nul = std.mem.indexOfScalar(u8, data, 0) orelse return null;
-	if (!international) {
-		if (nul + 2 > data.len or data[nul + 1] != 0) return null;
-		return nul + 2;
-	}
-	if (nul + 3 > data.len or data[nul + 1] != 1 or data[nul + 2] != 0) return null;
-	var pos = nul + 3;
-	for (0..2) |_| { // language tag and translated keyword
-		pos = (std.mem.indexOfScalarPos(u8, data, pos, 0) orelse return null) + 1;
-	}
-	return pos;
-}
+pub const BlockType = enum(u2) { stored = 0, fixed = 1, dynamic = 2, reserved = 3 };
 
 // ── bit reader ──────────────────────────────────────────────────────────────
 
@@ -318,22 +303,26 @@ pub const HuffDec = struct {
 	}
 };
 
-// Fixed Huffman tables (RFC 1951 §3.2.6).
+// Fixed Huffman code lengths (RFC 1951 §3.2.6).
+pub const fixed_ll_lengths: [288]u8 = blk: {
+	var a: [288]u8 = undefined;
+	var i: usize = 0;
+	while (i < 144) : (i += 1) a[i] = 8;
+	while (i < 256) : (i += 1) a[i] = 9;
+	while (i < 280) : (i += 1) a[i] = 7;
+	while (i < 288) : (i += 1) a[i] = 8;
+	break :blk a;
+};
+pub const fixed_dist_lengths = [_]u8{5} ** 32;
+
 pub fn fixedLL() HuffDec {
 	@setEvalBranchQuota(10000);
-	var lengths: [288]u8 = undefined;
-	var i: usize = 0;
-	while (i < 144) : (i += 1) lengths[i] = 8;
-	while (i < 256) : (i += 1) lengths[i] = 9;
-	while (i < 280) : (i += 1) lengths[i] = 7;
-	while (i < 288) : (i += 1) lengths[i] = 8;
-	return HuffDec.build(&lengths).?;
+	return HuffDec.build(&fixed_ll_lengths).?;
 }
 
 pub fn fixedDist() HuffDec {
 	@setEvalBranchQuota(10000);
-	const lengths = [_]u8{5} ** 32;
-	return HuffDec.build(&lengths).?;
+	return HuffDec.build(&fixed_dist_lengths).?;
 }
 
 /// Comptime-built shared fixed tables — call sites use these instead of
@@ -396,14 +385,9 @@ test "HuffDec prefix table matches canonical walk on valid and truncated inputs"
 	var long_incomplete = [_]u8{0} ** MAX_SYMS;
 	for ([_]u8{ 1, 3, 4, 9, 10, 15 }, 0..) |len, sym| long_incomplete[sym] = len;
 	try testDecoderParity(&long_incomplete, &state);
-	var fixed_ll_lengths = [_]u8{0} ** 288;
-	var fixed_i: usize = 0;
-	while (fixed_i < 144) : (fixed_i += 1) fixed_ll_lengths[fixed_i] = 8;
-	while (fixed_i < 256) : (fixed_i += 1) fixed_ll_lengths[fixed_i] = 9;
-	while (fixed_i < 280) : (fixed_i += 1) fixed_ll_lengths[fixed_i] = 7;
-	while (fixed_i < 288) : (fixed_i += 1) fixed_ll_lengths[fixed_i] = 8;
+
 	try testDecoderParity(&fixed_ll_lengths, &state);
-	try testDecoderParity(&([_]u8{5} ** 32), &state);
+	try testDecoderParity(&fixed_dist_lengths, &state);
 
 	// Generate complete prefix trees by repeatedly splitting a leaf, shuffle
 	// their code lengths across symbols, and sometimes remove one leaf to
@@ -501,27 +485,27 @@ pub fn HuffEnc(comptime n: usize) type {
 
 /// length (3..258) → (code 257..285, extra_bits). Index 0..2 unused.
 pub const LenCode = struct { code: u16, extra: u3 };
-pub const lenCodeTable: [259]LenCode = blk: {
-	var t: [259]LenCode = undefined;
+pub const lenCodeTable: [MAX_MATCH_LENGTH + 1]LenCode = blk: {
+	var t: [MAX_MATCH_LENGTH + 1]LenCode = undefined;
 	var i: usize = 0;
 	while (i < LEN_BASE.len) : (i += 1) {
 		const base = LEN_BASE[i];
 		const end = if (i + 1 < LEN_BASE.len) LEN_BASE[i + 1] else base + 1;
 		var n: usize = base;
-		while (n < end) : (n += 1) t[n] = .{ .code = @intCast(257 + i), .extra = LEN_EXTRA[i] };
+		while (n < end) : (n += 1) t[n] = .{ .code = @intCast(FIRST_LENGTH_SYMBOL + i), .extra = LEN_EXTRA[i] };
 	}
 	break :blk t;
 };
 
 /// distance (1..32768) → (code 0..29, extra_bits). Index 0 unused.
 pub const DistCode = struct { code: u16, extra: u4 };
-pub const distCodeTable: [32769]DistCode = blk: {
+pub const distCodeTable: [WINDOW_SIZE + 1]DistCode = blk: {
 	@setEvalBranchQuota(200000);
-	var t: [32769]DistCode = undefined;
+	var t: [WINDOW_SIZE + 1]DistCode = undefined;
 	var i: usize = 0;
 	while (i < DIST_BASE.len) : (i += 1) {
 		const base = DIST_BASE[i];
-		const end = if (i + 1 < DIST_BASE.len) DIST_BASE[i + 1] else 32769;
+		const end = if (i + 1 < DIST_BASE.len) DIST_BASE[i + 1] else WINDOW_SIZE + 1;
 		var d: usize = base;
 		while (d < end) : (d += 1) t[d] = .{ .code = @intCast(i), .extra = DIST_EXTRA[i] };
 	}
@@ -530,43 +514,26 @@ pub const distCodeTable: [32769]DistCode = blk: {
 
 // ── CL code-length sequence parser ──────────────────────────────────────────
 
-/// Parse `n` code lengths from a CL Huffman stream into out[0..n].
+/// Fill out with code lengths from a CL Huffman stream.
 /// Returns false on a malformed sequence.
-pub fn parseClLengths(r: *BitReader, cl: *const HuffDec, out: []u8, n: usize) bool {
+pub fn parseClLengths(r: *BitReader, cl: *const HuffDec, out: []u8) bool {
 	var i: usize = 0;
-	while (i < n) {
+	while (i < out.len) {
 		const sym = cl.decode(r) orelse return false;
 		if (sym <= 15) {
 			out[i] = @intCast(sym);
 			i += 1;
-		} else if (sym == 16) {
-			if (i == 0) return false; // copy-previous at start
-			const count = r.read(2) + 3;
-			const prev = out[i - 1];
-			var c: u32 = 0;
-			while (c < count and i < n) : (c += 1) {
-				out[i] = prev;
-				i += 1;
-			}
-			if (c < count) return false; // ran past alphabet → malformed
-		} else if (sym == 17) {
-			const count = r.read(3) + 3;
-			var c: u32 = 0;
-			while (c < count and i < n) : (c += 1) {
-				out[i] = 0;
-				i += 1;
-			}
-			if (c < count) return false;
-		} else if (sym == 18) {
-			const count = r.read(7) + 11;
-			var c: u32 = 0;
-			while (c < count and i < n) : (c += 1) {
-				out[i] = 0;
-				i += 1;
-			}
-			if (c < count) return false;
 		} else {
-			return false;
+			if (sym == 16 and i == 0) return false;
+			const count = switch (sym) {
+				16 => r.read(2) + 3,
+				17 => r.read(3) + 3,
+				18 => r.read(7) + 11,
+				else => return false,
+			};
+			if (count > out.len - i) return false;
+			@memset(out[i..][0..count], if (sym == 16) out[i - 1] else 0);
+			i += count;
 		}
 	}
 	return true;
