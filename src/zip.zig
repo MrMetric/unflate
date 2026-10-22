@@ -352,8 +352,6 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: deflate.Options, 
 }
 
 const measure = @import("deflmeasure.zig");
-const Statistics = measure.Statistics;
-const ERR: i64 = -1;
 
 test "ZIP suffix survives roundtrip and optimization" {
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -391,24 +389,21 @@ test "ZIP suffix survives roundtrip and optimization" {
 	try std.testing.expectEqualSlices(u8, empty_with_suffix, try optimize(a, empty_with_suffix, .{}, false));
 }
 
-pub fn count(data: []const u8, s: *Statistics) i64 {
+pub fn count(data: []const u8) !measure.Statistics {
 	var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer arena.deinit();
-	const arc = parseZipMembers(arena.allocator(), data) catch return ERR;
+	const arc = try parseZipMembers(arena.allocator(), data);
 	if (arc.passthrough) {
-		s.opaque_streams += 1;
-		return 0;
+		return .{ .opaque_streams = 1 };
 	}
-	var total: i64 = 0;
+	var total: measure.Statistics = .{};
 	for (arc.entries) |entry| {
 		if (entry.method != ZIP_METHOD_DEFLATE) continue;
 		if (entry.gp_flag & ZIP_FLAG_ENCRYPTED != 0) {
-			s.opaque_streams += 1;
+			total.opaque_streams += 1;
 			continue;
 		}
-		const bits = measure.count(entry.data, s);
-		if (bits < 0) return ERR;
-		total += bits;
+		total.add(try measure.count(entry.data));
 	}
 	return total;
 }

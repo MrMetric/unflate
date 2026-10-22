@@ -27,16 +27,8 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: deflate.Options) 
 }
 
 const measure = @import("deflmeasure.zig");
-const Statistics = measure.Statistics;
-const ERR: i64 = -1;
-/// Count DEFLATE bits, excluding zlib framing. With stats, validate the header
-/// and exact stream extent, but not Adler-32. Without stats, inputs of at most
-/// six bytes contribute zero. Parse failures return -1.
-pub fn count(data: []const u8, stats: ?*Statistics) i64 {
-	if (stats != null) {
-		if (data.len < 8 or !supportedHeader(data[0..2])) return ERR;
-	}
-	if (data.len <= 6) return 0;
-	return measure.count(data[2 .. data.len - 4], stats);
+/// Measure the payload without checking Adler-32.
+pub fn count(data: []const u8) error{Malformed}!measure.Statistics {
+	if (data.len < 8 or !supportedHeader(data[0..2])) return error.Malformed;
+	return measure.count(data[2 .. data.len - 4]);
 }
-

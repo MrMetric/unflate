@@ -357,46 +357,29 @@ test "PNG: truncated zlib streams are refused or kept before std.compress.flate 
 
 
 const measure = @import("deflmeasure.zig");
-const Statistics = measure.Statistics;
-const ERR: i64 = -1;
 /// Count auxiliary DEFLATE bits (zTXt, iCCP, compressed iTXt). Invalid or
-/// unsupported payloads contribute zero. Frame reassembly is handled in count.
-fn countAuxChunk(typ: []const u8, cdata: []const u8, stats: ?*Statistics) i64 {
+/// unsupported payloads contribute zero bits. Frame reassembly is handled in count.
+fn countAuxChunk(typ: []const u8, cdata: []const u8) measure.Statistics {
 	const international = std.mem.eql(u8, typ, "iTXt");
-	if (!international and !std.mem.eql(u8, typ, "zTXt") and !std.mem.eql(u8, typ, "iCCP")) return 0;
+	if (!international and !std.mem.eql(u8, typ, "zTXt") and !std.mem.eql(u8, typ, "iCCP")) return .{};
 	if (international) {
 		// Flag zero denotes ordinary text, not an opaque compressed stream.
 		if (std.mem.indexOfScalar(u8, cdata, 0)) |nul| {
-			if (nul + 1 < cdata.len and cdata[nul + 1] == 0) return 0;
+			if (nul + 1 < cdata.len and cdata[nul + 1] == 0) return .{};
 		}
 	}
-	if (stats != null or international) {
-		const data = if (pngCompressedOffset(typ, cdata)) |offset| cdata[offset..] else null;
-		return countOptionalStream(data, stats);
-	}
-	// Historical zTXt/iCCP counters ignore the compression method byte.
-	const nul = std.mem.indexOfScalar(u8, cdata, 0) orelse return 0;
-	if (nul + 2 > cdata.len) return 0;
-	const bits = zlib.count(cdata[nul + 2 ..], null);
-	return if (bits < 0) 0 else bits;
+	const data = if (pngCompressedOffset(typ, cdata)) |offset| cdata[offset..] else null;
+	return countOptionalStream(data);
 }
 
-/// Roll back partial measurements and legality when an optional stream fails.
-fn countOptionalStream(data: ?[]const u8, stats: ?*Statistics) i64 {
-	const saved = if (stats) |s| s.* else Statistics{};
-	const saved_class = measure.worst_class;
-	const bits = if (data) |bytes| zlib.count(bytes, stats) else ERR;
-	if (bits >= 0) return bits;
-	if (stats) |s| {
-		s.* = saved;
-		s.opaque_streams += 1;
-	}
-	measure.worst_class = saved_class;
-	return 0;
+/// Optional streams contribute only successful measurements; failures are opaque.
+fn countOptionalStream(data: ?[]const u8) measure.Statistics {
+	const failed: measure.Statistics = .{ .opaque_streams = 1 };
+	return zlib.count(data orelse return failed) catch failed;
 }
 
-pub fn count(data: []const u8, stats: ?*Statistics) i64 {
-	if (data.len < 8 or !std.mem.eql(u8, data[0..8], &PNG_SIG)) return ERR;
+pub fn count(data: []const u8) !measure.Statistics {
+	if (data.len < 8 or !std.mem.eql(u8, data[0..8], &PNG_SIG)) return error.Malformed;
 
 	// Measurement concatenates all IDAT, including malformed chunk ordering.
 	const alloc = std.heap.page_allocator;
@@ -414,49 +397,40 @@ pub fn count(data: []const u8, stats: ?*Statistics) i64 {
 	var frame_present = false;
 	var frame_malformed = false;
 
-	var aux_total: i64 = 0;
+	var total: measure.Statistics = .{};
 	var pos: usize = 8;
 	while (pos + 8 <= data.len) {
 		const length: usize = @intCast(rdint_be(u32, data, pos));
-		if (pos + 12 + length > data.len) {
-			if (stats != null) return ERR;
-			break;
-		}
+		if (pos + 12 + length > data.len) return error.Malformed;
 		const typ = data[pos + 4 .. pos + 8];
 		const cdata = data[pos + 8 .. pos + 8 + length];
 		const is_idat = std.mem.eql(u8, typ, "IDAT");
 		const is_fdat = std.mem.eql(u8, typ, "fdAT");
-		// Actual groups end at every non-fdAT chunk. Preserve historical
-		// counters' cross-IDAT grouping for malformed chunk orders only.
-		if (frame_present and !is_fdat and (stats != null or !is_idat)) {
-			// Historical counters ignore short fdAT fragments.
-			aux_total += countOptionalStream(if (stats != null and frame_malformed) null else frame.items, stats);
+		if (frame_present and !is_fdat) {
+			total.add(countOptionalStream(if (frame_malformed) null else frame.items));
 			frame.clearRetainingCapacity();
 			frame_present = false;
 			frame_malformed = false;
 		}
 		if (is_idat) {
-			idat.appendSlice(alloc, cdata) catch return ERR;
+			try idat.appendSlice(alloc, cdata);
 		} else if (is_fdat) {
 			frame_present = true;
 			if (cdata.len >= 4) {
-				frame.appendSlice(alloc, cdata[4..]) catch return ERR;
+				try frame.appendSlice(alloc, cdata[4..]);
 			} else {
 				frame_malformed = true;
 			}
 		} else {
-			aux_total += countAuxChunk(typ, cdata, stats);
+			total.add(countAuxChunk(typ, cdata));
 		}
 		pos += 12 + length;
 	}
 	if (frame_present) { // trailing frame (file ends on fdAT)
-		aux_total += countOptionalStream(if (stats != null and frame_malformed) null else frame.items, stats);
+		total.add(countOptionalStream(if (frame_malformed) null else frame.items));
 	}
 
-	if (idat.items.len < 6) return ERR; // need zlib hdr(2) + adler(4)
-	if (stats != null and pos != data.len) return ERR;
-	const idat_bits = if (stats != null) zlib.count(idat.items, stats) else measure.count(idat.items[2 .. idat.items.len - 4], null);
-	if (idat_bits < 0) return ERR; // IDAT failure propagates
-	return idat_bits + aux_total;
+	if (pos != data.len) return error.Malformed;
+	total.add(try zlib.count(idat.items));
+	return total;
 }
-

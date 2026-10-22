@@ -44,4 +44,5 @@ pub fn optimize(a: std.mem.Allocator, format: Format, in: []const u8, options: O
 
 test {
 	std.testing.refAllDecls(@This());
+	std.testing.refAllDecls(@import("deflmeasure.zig"));
 }

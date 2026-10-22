@@ -100,22 +100,18 @@ pub fn roundtrip(a: std.mem.Allocator, in: []const u8) ![]const u8 {
 }
 
 const measure = @import("deflmeasure.zig");
-const Statistics = measure.Statistics;
-const ERR: i64 = -1;
-pub fn count(data: []const u8, stats: ?*Statistics) i64 {
+pub fn count(data: []const u8) error{Malformed}!measure.Statistics {
 	// Walk every member, including BGZF. Check framing, not header flags or checksums.
-	if (data.len == 0) return ERR;
-	var total: i64 = 0;
+	if (data.len == 0) return error.Malformed;
+	var total: measure.Statistics = .{};
 	var pos: usize = 0;
 	while (pos < data.len) {
 		const rem = data[pos..];
-		const hlen = parseHeader(rem, false) orelse return ERR;
-		var r = @import("deflcommon.zig").BitReader{ .data = rem[hlen..] };
-		const bits = measure.countReader(&r, stats);
-		if (bits < 0) return ERR;
-		const consumed = (r.pos() + 7) / 8;
-		if (hlen + consumed + 8 > rem.len) return ERR; // missing member trailer
-		total += bits;
+		const hlen = parseHeader(rem, false) orelse return error.Malformed;
+		const result = try measure.scan(rem[hlen..]);
+		const consumed: usize = @intCast((result.bits + 7) / 8);
+		if (hlen + consumed + 8 > rem.len) return error.Malformed; // missing member trailer
+		total.add(result);
 		pos += hlen + consumed + 8;
 	}
 	return total;
