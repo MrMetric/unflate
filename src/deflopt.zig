@@ -7,6 +7,13 @@ const deflasm = @import("deflasm.zig");
 const reparse = @import("deflreparse.zig");
 const ir = @import("deflir.zig");
 const feedback = @import("deflfeedback.zig");
+const encoding = @import("deflencoding.zig");
+const freqToLengths = encoding.freqToLengths;
+const dynBlockCost = encoding.bitCost;
+const MAX_CL_SEQ = encoding.MAX_CL_SEQ;
+const clHeaderBits = encoding.clHeaderBits;
+const hclenOf = encoding.hclenOf;
+const trim = encoding.trim;
 const boundary = @import("deflboundary.zig");
 
 const Block = deflasm.Block;
@@ -16,334 +23,6 @@ const ClEntry = deflasm.ClEntry;
 const lenCodeTable = common.lenCodeTable;
 const distCodeTable = common.distCodeTable;
 const HCLEN_ORDER = common.HCLEN_ORDER;
-
-// Huffman ties use (frequency, creation index), including internal nodes.
-const HuffmanNode = struct {
-	freq: u64,
-	id: u32,
-
-	fn lessThan(_: void, a: HuffmanNode, b: HuffmanNode) bool {
-		return a.freq < b.freq or (a.freq == b.freq and a.id < b.id);
-	}
-};
-const MAX_LEAVES = 286;
-const MAX_NODES = 2 * MAX_LEAVES;
-
-/// Sort leaves once, then merge two queues: leaves and newly created nodes.
-/// Internal frequencies are nondecreasing; leaves win ties against internal
-/// nodes because their creation indices are smaller. No heap or tree walk.
-fn huffmanDepths(lf: []const u64, depth_out: []u32) void {
-	const n = lf.len;
-	std.debug.assert(n >= 2 and n <= MAX_LEAVES);
-	var nodes: [MAX_NODES]HuffmanNode = undefined;
-	var parents: [MAX_NODES]u32 = undefined;
-	for (lf, 0..) |freq, i| nodes[i] = .{ .freq = freq, .id = @intCast(i) };
-	std.mem.sort(HuffmanNode, nodes[0..n], {}, HuffmanNode.lessThan);
-	var leaf: usize = 0;
-	var internal: usize = n;
-	const root = 2 * n - 2;
-	for (n..root + 1) |id| {
-		var sum: u64 = 0;
-		for (0..2) |_| {
-			const take_leaf = leaf < n and (internal == id or nodes[leaf].freq <= nodes[internal].freq);
-			const child = if (take_leaf) nodes[leaf] else nodes[internal];
-			if (take_leaf) leaf += 1 else internal += 1;
-			parents[child.id] = @intCast(id);
-			sum += child.freq;
-		}
-		nodes[id] = .{ .freq = sum, .id = @intCast(id) };
-	}
-	// Parents have larger creation indices. In reverse order, replace each
-	// parent link with its depth after the parent's depth is already known.
-	parents[root] = 0;
-	var child = root;
-	while (child > 0) {
-		child -= 1;
-		parents[child] = parents[parents[child]] + 1;
-	}
-	@memcpy(depth_out, parents[0..n]);
-}
-
-test "Huffman depths preserve frequency and creation-order ties" {
-	var prng = std.Random.DefaultPrng.init(0x68756666);
-	const random = prng.random();
-	for (0..1024) |trial| {
-		const n = 2 + trial % (MAX_LEAVES - 1);
-		var freq: [MAX_LEAVES]u64 = undefined;
-		for (freq[0..n], 0..) |*f, i| f.* = switch (trial % 4) {
-			0 => 1,
-			1 => random.intRangeAtMost(u64, 1, 7),
-			2 => @as(u64, 1) << @intCast(i % 32),
-			else => random.intRangeAtMost(u64, 1, std.math.maxInt(u32)),
-		};
-		// Independent quadratic oracle: scan live nodes for each minimum,
-		// with the lower creation index winning equal-frequency ties.
-		var weights: [MAX_NODES]u64 = @splat(std.math.maxInt(u64));
-		var parents: [MAX_NODES]usize = undefined;
-		@memcpy(weights[0..n], freq[0..n]);
-		for (n..2 * n - 1) |parent| {
-			var sum: u64 = 0;
-			for (0..2) |_| {
-				var best: usize = 0;
-				for (0..parent) |j| {
-					if (weights[j] < weights[best]) best = j;
-				}
-				sum += weights[best];
-				parents[best] = parent;
-				weights[best] = std.math.maxInt(u64);
-			}
-			weights[parent] = sum;
-		}
-		var actual: [MAX_LEAVES]u32 = undefined;
-		huffmanDepths(freq[0..n], actual[0..n]);
-		for (actual[0..n], 0..) |depth, leaf| {
-			var expected: u32 = 0;
-			var node = leaf;
-			while (node != 2 * n - 2) : (node = parents[node]) expected += 1;
-			try std.testing.expectEqual(expected, depth);
-		}
-	}
-}
-
-/// Static round cap for freqToLengths' length-limiting loop. Release builds use
-/// this constant; a debug assert (std.debug.assert, compiled out in ReleaseFast)
-/// checks the tight per-call bound each call. Rounds are bounded by
-/// 1 + n*(bitlen(fmax)+1); worst DEFLATE case n=286, u32 fmax => <= 9439 << cap.
-const FREQ_LIMIT_ROUNDS: u32 = 16384;
-
-/// Exact-match memo for freqToLengths, same construction (and the same
-/// byte-exactness argument) as the dpClSection memo below: pure function,
-/// full key compare on hit, collision = miss. ~800 KB TLS per thread.
-const FreqMemoEntry = struct {
-	alphabet: u16,
-	max_bits: u8,
-	freq: [MAX_LEAVES]u32,
-	out: [MAX_LEAVES]u8,
-};
-threadlocal var freq_memo_used: [512]bool = @splat(false);
-threadlocal var freq_memo: [512]FreqMemoEntry = undefined;
-
-pub fn freqToLengths(freq: []const u32, max_bits: u32, out: []u8) void {
-	var h = std.hash.Wyhash.init(0);
-	h.update(std.mem.sliceAsBytes(freq));
-	h.update(std.mem.asBytes(&max_bits));
-	const slot: usize = @intCast(h.final() & 511);
-	const m = &freq_memo[slot];
-	if (freq_memo_used[slot] and m.alphabet == freq.len and m.max_bits == max_bits and
-		std.mem.eql(u32, m.freq[0..freq.len], freq))
-	{
-		@memcpy(out, m.out[0..freq.len]);
-		return;
-	}
-	freqToLengthsCompute(freq, max_bits, out);
-	m.alphabet = @intCast(freq.len);
-	m.max_bits = @intCast(max_bits);
-	@memcpy(m.freq[0..freq.len], freq);
-	@memcpy(m.out[0..freq.len], out);
-	freq_memo_used[slot] = true;
-}
-
-/// Code lengths from symbol frequencies, length-limited to max_bits via the
-/// frequency-doubling loop. freq[sym] is a count (0 = absent). Writes out[0..
-/// alphabet]; out has length == freq.len == alphabet.
-/// Allocation-free (MAX_LEAVES-bounded stack buffers) — this is the hottest
-/// leaf of every cost evaluation.
-fn freqToLengthsCompute(freq: []const u32, max_bits: u32, out: []u8) void {
-	@memset(out, 0);
-	const alphabet = freq.len;
-	std.debug.assert(alphabet <= MAX_LEAVES);
-
-	// Present symbols in ascending order (array iteration => sorted by symbol).
-	var n: usize = 0;
-	for (freq) |f| {
-		if (f > 0) n += 1;
-	}
-	if (n == 0) return;
-	if (n == 1) {
-		for (freq, 0..) |f, s| {
-			if (f > 0) {
-				out[s] = 1;
-				return;
-			}
-		}
-	}
-
-	var syms_buf: [MAX_LEAVES]u16 = undefined;
-	var lf_buf: [MAX_LEAVES]u64 = undefined;
-	const syms = syms_buf[0..n];
-	const lf = lf_buf[0..n];
-	{
-		var k: usize = 0;
-		var s: usize = 0;
-		while (s < alphabet) : (s += 1) {
-			if (freq[s] > 0) {
-				syms[k] = @intCast(s);
-				lf[k] = freq[s];
-				k += 1;
-			}
-		}
-	}
-
-	// Length-limit to max_bits (proof in deflasm.freq_to_lengths): an over-deep
-	// leaf always has freq < fmax, so doubling never grows the maximum frequency
-	// (fmax is invariant) and rounds <= 1 + n*(bitlen(fmax)+1). Release uses the
-	// static FREQ_LIMIT_ROUNDS cap; debug asserts the tight per-call bound.
-	var fmax0: u64 = 0;
-	for (lf) |f| fmax0 = @max(fmax0, f);
-	const fbits: u64 = @as(u64, std.math.log2_int(u64, fmax0)) + 1; // bit length (fmax0 >= 1)
-	const derived_cap: u64 = 1 + @as(u64, n) * (fbits + 1);
-
-	var depth_buf: [MAX_LEAVES]u32 = undefined;
-	const depth = depth_buf[0..n];
-	var round: u32 = 0;
-	while (round < FREQ_LIMIT_ROUNDS) : (round += 1) {
-		huffmanDepths(lf, depth);
-		var any_over = false;
-		for (depth) |d| {
-			if (d > max_bits) {
-				any_over = true;
-				break;
-			}
-		}
-		if (!any_over) break;
-		for (depth, 0..) |d, j| {
-			if (d > max_bits) lf[j] *= 2;
-		}
-	} else {
-		// Exceeding the cap violates the length-limiting termination invariant.
-		// This is an optimizer bug, not a catchable malformed-input error.
-		@panic("freqToLengths: exceeded static round cap (length-limiting termination invariant violated)");
-	}
-	// Debug-mode invariant: convergence stayed within the proven per-call bound
-	// (compiled out in ReleaseFast; live in Debug/ReleaseSafe).
-	std.debug.assert(round <= derived_cap);
-
-	for (syms, depth) |s, d| {
-		out[s] = @intCast(@min(d, max_bits));
-	}
-}
-
-// ── CL RLE encoder ─────────────────────────────
-
-/// Generate CL RLE entries for `lengths`, appending to `entries`.
-fn genClEntries(
-	alloc: std.mem.Allocator,
-	lengths: []const u8,
-	entries: *std.ArrayList(ClEntry),
-) !void {
-	var i: usize = 0;
-	const len = lengths.len;
-	while (i < len) {
-		const v = lengths[i];
-		if (v == 0) {
-			var j = i;
-			while (j < len and lengths[j] == 0) j += 1;
-			var count: usize = j - i;
-			while (count > 0) {
-				if (count >= 11) {
-					const run = @min(count, 138);
-					try entries.append(alloc, .{ .kind = .rep18, .val = @intCast(run) });
-					count -= run;
-				} else if (count >= 3) {
-					const run = @min(count, 10);
-					try entries.append(alloc, .{ .kind = .rep17, .val = @intCast(run) });
-					count -= run;
-				} else {
-					try entries.append(alloc, .{ .kind = .lit, .val = 0 });
-					count -= 1;
-				}
-			}
-			i = j;
-		} else {
-			try entries.append(alloc, .{ .kind = .lit, .val = v });
-			i += 1;
-			var j = i;
-			while (j < len and lengths[j] == v and j - i < 6) j += 1;
-			var run: usize = j - i;
-			while (run >= 3) {
-				const r = @min(run, 6);
-				try entries.append(alloc, .{ .kind = .rep16, .val = @intCast(r) });
-				run -= r;
-				i += r;
-			}
-		}
-	}
-}
-
-// ── dynamic-block builder ──────────
-
-/// Drop trailing zeros from lengths, keeping length >= min_len. Returns the
-/// trimmed slice length.
-fn trimLen(lengths: []const u8, min_len: usize) usize {
-	var end = lengths.len;
-	while (end > min_len and lengths[end - 1] == 0) end -= 1;
-	return end;
-}
-
-/// Build a dynamic Huff block from `tokens` (the optimizer's canonical
-/// re-encoding). Under drop_258 the
-/// Huffman build weights symbol 284 by its true emission count (one per
-/// length-258 match); unit_284 gives it a flat +1 instead — neither weighting
-/// dominates (Huffman minimizes payload, not payload+header), so optimizeBlock
-/// tries both drop variants.
-pub fn makeDynamicBlock(alloc: std.mem.Allocator, tokens: []const Token, is_last: bool, drop_258: bool, unit_284: bool) !Block {
-	// Token frequencies (ll over 286, dist over 30).
-	var ll_freq = [_]u32{0} ** 286;
-	var dist_freq = [_]u32{0} ** 30;
-	var any_dist = false;
-	for (tokens) |tok| {
-		switch (tok) {
-			.lit => |b| ll_freq[b] += 1,
-			.match => |m| {
-				ll_freq[lenCodeTable[m.length].code] += 1;
-				dist_freq[distCodeTable[m.distance].code] += 1;
-				any_dist = true;
-			},
-		}
-	}
-	if (ll_freq[common.EOB] == 0) ll_freq[common.EOB] = 1;
-	if (drop_258) {
-		// Omit LL symbol 285; length-258 matches route through 284+5+31
-		// (dynBlockCost / assemble pick 284 automatically when 285 is absent).
-		const n258 = ll_freq[285];
-		ll_freq[285] = 0;
-		ll_freq[284] += if (unit_284) 1 else n258;
-	}
-
-	var ll_full = [_]u8{0} ** 286;
-	freqToLengths(&ll_freq, 15, &ll_full);
-	const ll_len = trimLen(&ll_full, common.EOB + 1);
-	const ll_lengths = try alloc.dupe(u8, ll_full[0..ll_len]);
-
-	var dist_lengths: []u8 = undefined;
-	var entries: std.ArrayList(ClEntry) = .empty;
-	var cl_lengths = [_]u8{0} ** 19;
-	if (any_dist) {
-		var dist_full = [_]u8{0} ** 30;
-		freqToLengths(&dist_freq, 15, &dist_full);
-		distFloor(&dist_full);
-		const dist_len = trimLen(&dist_full, 1);
-		dist_lengths = try alloc.dupe(u8, dist_full[0..dist_len]);
-
-		const built = try buildCl(alloc, ll_lengths, dist_lengths);
-		entries = built.entries;
-		cl_lengths = built.cl_lengths;
-	} else {
-		const e = try emptyDistCl(alloc, ll_lengths, .full);
-		dist_lengths = try alloc.dupe(u8, e.dist);
-		entries = e.built.entries;
-		cl_lengths = e.built.cl_lengths;
-	}
-
-	return .{ .is_last = is_last, .body = .{ .huff = .{
-		.is_fixed = false,
-		.tokens = tokens,
-		.ll_lengths = ll_lengths,
-		.dist_lengths = dist_lengths,
-		.cl_lengths = cl_lengths,
-		.cl_entries = entries.items,
-	} } };
-}
 
 // ── cost models ─────────────────────
 
@@ -356,309 +35,6 @@ const SCRATCH_RETAIN_LIMIT: usize = 8 << 20;
 const SCRATCH_RESET: std.heap.ArenaAllocator.ResetMode = .{ .retain_with_limit = SCRATCH_RETAIN_LIMIT };
 
 const fixed_ll_bits = common.fixed_ll_lengths;
-
-fn clEntriesBits(cl_enc: *const common.HuffEnc(19), entries: []const ClEntry) i64 {
-	var bits: i64 = 0;
-	for (entries) |e| {
-		switch (e.kind) {
-			.lit => bits += cl_enc.len[e.val],
-			.rep16 => bits += @as(i64, cl_enc.len[16]) + 2,
-			.rep17 => bits += @as(i64, cl_enc.len[17]) + 3,
-			.rep18 => bits += @as(i64, cl_enc.len[18]) + 7,
-			.sep => {},
-		}
-	}
-	return bits;
-}
-
-fn hclenOf(cl_lengths: []const u8) usize {
-	var hclen: usize = 19;
-	while (hclen > 4 and cl_lengths[HCLEN_ORDER[hclen - 1]] == 0) hclen -= 1;
-	return hclen;
-}
-
-fn clFreqOf(entries: []const ClEntry) [19]u32 {
-	var cl_freq = [_]u32{0} ** 19;
-	for (entries) |e| switch (e.kind) {
-		.lit => cl_freq[e.val] += 1,
-		.rep16 => cl_freq[16] += 1,
-		.rep17 => cl_freq[17] += 1,
-		.rep18 => cl_freq[18] += 1,
-		.sep => {},
-	};
-	return cl_freq;
-}
-
-fn clHeaderBits(cl_lengths: *const [19]u8, entries: []const ClEntry) !i64 {
-	const cl_enc = common.HuffEnc(19).build(cl_lengths) orelse return error.Malformed;
-	return @as(i64, @intCast(17 + hclenOf(cl_lengths) * 3)) + clEntriesBits(&cl_enc, entries);
-}
-
-// Cost charged in dpClSection for a CL symbol absent from the current tree.
-const CL_UNUSED_COST: i64 = 7;
-
-/// Minimum-cost CL RLE encoding with deterministic ties: literal, rep16,
-/// rep17, rep18, then ascending repeat length. The largest section is the
-/// combined literal/length and distance sequence (286 + 30 lengths).
-const MAX_CL_SEQ = MAX_LEAVES + 30;
-
-/// Exact-match memo for dpClSection (direct-mapped, threadlocal). The DP is a
-/// pure function of (costs, seq), and the call profile is dominated by exact
-/// repeats: the union driver re-runs the same seed chains in both config
-/// passes, buildCl's chains re-iterate converged length vectors, and the
-/// polish loops re-price near-identical candidates (394,584 calls on a 63 KB
-/// jar, all via buildClImpl). A hit replays the stored entries only after a
-/// FULL key compare — a collision is a miss, never a wrong answer — so the
-/// output is byte-identical by construction. ~1.6 MB TLS per thread (1024 slots).
-const DpMemoEntry = struct {
-	costs: [19]u8,
-	seq_len: u16,
-	n_entries: u16,
-	seq: [MAX_CL_SEQ]u8,
-	entries: [MAX_CL_SEQ]ClEntry,
-};
-threadlocal var dp_memo_used: [1024]bool = @splat(false);
-threadlocal var dp_memo: [1024]DpMemoEntry = undefined;
-
-fn dpMemoSlot(seq: []const u8, costs: *const [19]u8) usize {
-	var h = std.hash.Wyhash.init(0);
-	h.update(costs);
-	h.update(seq);
-	return @intCast(h.final() & 1023);
-}
-
-fn dpClSection(
-	alloc: std.mem.Allocator,
-	seq: []const u8,
-	costs: *const [19]u8,
-	entries: *std.ArrayList(ClEntry),
-) !void {
-	const slot = dpMemoSlot(seq, costs);
-	const m = &dp_memo[slot];
-	if (dp_memo_used[slot] and m.seq_len == seq.len and
-		std.mem.eql(u8, &m.costs, costs) and
-		std.mem.eql(u8, m.seq[0..seq.len], seq))
-	{
-		try entries.appendSlice(alloc, m.entries[0..m.n_entries]);
-		return;
-	}
-	const start = entries.items.len;
-	try dpClSectionCompute(alloc, seq, costs, entries);
-	const produced = entries.items[start..];
-	m.costs = costs.*;
-	m.seq_len = @intCast(seq.len);
-	@memcpy(m.seq[0..seq.len], seq);
-	m.n_entries = @intCast(produced.len);
-	@memcpy(m.entries[0..produced.len], produced);
-	dp_memo_used[slot] = true;
-}
-
-/// Reconstruct the same fixed-price DP optimum one maximal run at a time.
-/// Tables retain the original literal/16/17/18 and ascending-count tie order.
-fn dpClSectionCompute(alloc: std.mem.Allocator, seq: []const u8, costs: *const [19]u8, entries: *std.ArrayList(ClEntry)) !void {
-	std.debug.assert(seq.len <= MAX_CL_SEQ);
-	var price: [19]u8 = undefined;
-	for (costs, &price) |c, *p| p.* = if (c != 0) c else @intCast(CL_UNUSED_COST);
-	var rev: [MAX_CL_SEQ]ClEntry = undefined;
-	var nr: usize = 0;
-	var end = seq.len;
-	while (end > 0) {
-		const v = seq[end - 1];
-		var start = end - 1;
-		while (start > 0 and seq[start - 1] == v) start -= 1;
-		const table = if (v == 0) zeroRunTable(price[0], price[16], price[17], price[18])
-			else &nonzero_run_tables[price[v]][price[16]];
-		var n = end - start;
-		while (n > 0) {
-			const step = table.steps[n];
-			rev[nr] = .{ .kind = step.kind, .val = if (step.kind == .lit) v else step.count };
-			nr += 1;
-			n -= step.count;
-		}
-		end = start;
-	}
-	try entries.ensureUnusedCapacity(alloc, nr);
-	while (nr > 0) {
-		nr -= 1;
-		entries.appendAssumeCapacity(rev[nr]);
-	}
-}
-
-test "CL run reconstruction: exact entries and tie order match sequence DP" {
-	const Check = struct {
-		fn run(seq: []const u8, costs: *const [19]u8, left: *std.ArrayList(ClEntry), right: *std.ArrayList(ClEntry)) !void {
-			left.clearRetainingCapacity();
-			right.clearRetainingCapacity();
-			// Builders append to a prior section; preserve its prefix too.
-			try left.append(std.testing.allocator, .{ .kind = .sep, .val = 0 });
-			try right.append(std.testing.allocator, .{ .kind = .sep, .val = 0 });
-			try dpClSectionReference(std.testing.allocator, seq, costs, left);
-			try dpClSectionCompute(std.testing.allocator, seq, costs, right);
-			try std.testing.expectEqualDeep(left.items, right.items);
-		}
-	};
-	var left: std.ArrayList(ClEntry) = .empty;
-	defer left.deinit(std.testing.allocator);
-	var right: std.ArrayList(ClEntry) = .empty;
-	defer right.deinit(std.testing.allocator);
-	var seq: [MAX_CL_SEQ]u8 = @splat(0);
-	var costs = [_]u8{0} ** 19;
-	const boundaries = [_]usize{ 0, 1, 2, 3, 4, 6, 7, 10, 11, 12, 137, 138, 139, 140, 275, 276, 277, MAX_CL_SEQ };
-	// Include absent symbols: CL construction prices them at 7, whereas
-	// polish's internal guide prices them at 8. Do not conflate the two.
-	for (0..8) |literal| for (0..8) |r16| for (0..8) |r17| for (0..8) |r18| {
-		costs[0] = @intCast(literal);
-		costs[16] = @intCast(r16);
-		costs[17] = @intCast(r17);
-		costs[18] = @intCast(r18);
-		for (boundaries) |n| try Check.run(seq[0..n], &costs, &left, &right);
-	};
-	for (1..16) |v| {
-		@memset(&seq, @intCast(v));
-		for (0..8) |literal| for (0..8) |r16| {
-			costs[v] = @intCast(literal);
-			costs[16] = @intCast(r16);
-			for (boundaries) |n| try Check.run(seq[0..n], &costs, &left, &right);
-		};
-	}
-	for (0..4) |profile| {
-		for (&costs, 0..) |*v, i| v.* = @intCast((i * 3 + profile * (i + 1)) % 8);
-		var count: usize = 1;
-		for (0..9) |n| {
-			for (0..count) |code| {
-				var rest = code;
-				for (seq[0..n]) |*v| { v.* = @intCast(rest % 3); rest /= 3; }
-				try Check.run(seq[0..n], &costs, &left, &right);
-			}
-			count *= 3;
-		}
-	}
-}
-
-// Previous sequence-wide DP retained as an independent test oracle.
-fn dpClSectionReference(
-	alloc: std.mem.Allocator,
-	seq: []const u8,
-	costs: *const [19]u8,
-	entries: *std.ArrayList(ClEntry),
-) !void {
-	var cost: [19]i64 = undefined;
-	for (costs, 0..) |c, s| cost[s] = if (c != 0) c else CL_UNUSED_COST;
-	const c16 = cost[16] + 2;
-	const c17 = cost[17] + 3;
-	const c18 = cost[18] + 7;
-	const n = seq.len;
-	std.debug.assert(n <= MAX_CL_SEQ);
-	var f_buf: [MAX_CL_SEQ + 1]i64 = undefined;
-	var ch_kind_buf: [MAX_CL_SEQ + 1]deflasm.ClKind = undefined;
-	var ch_k_buf: [MAX_CL_SEQ + 1]u16 = undefined;
-	var run_buf: [MAX_CL_SEQ + 1]u32 = undefined;
-	var zrun_buf: [MAX_CL_SEQ + 1]u32 = undefined;
-	const f = f_buf[0 .. n + 1];
-	const ch_kind = ch_kind_buf[0 .. n + 1];
-	const ch_k = ch_k_buf[0 .. n + 1];
-	const run = run_buf[0 .. n + 1];
-	const zrun = zrun_buf[0 .. n + 1];
-	f[0] = 0;
-	run[0] = 0;
-	zrun[0] = 0;
-	for (1..n + 1) |i| {
-		const v = seq[i - 1];
-		run[i] = if (i > 1 and seq[i - 2] == v) run[i - 1] + 1 else 1;
-		zrun[i] = if (v == 0) zrun[i - 1] + 1 else 0;
-	}
-	// rep18 sliding-window minimum (the profile's dominant term was this
-	// branch's naive k-loop: up to 128 f[i-k] probes per position inside long
-	// zero runs). c18 is constant over k, so the k=11..min(138,zrun) candidate
-	// scan is a pure window minimum over f[j], j in [i-min(138,zrun), i-11] —
-	// a monotone deque gives it in O(1) amortized. Tie behavior preserved
-	// exactly: the naive loop's ascending-k strict < keeps the SMALLEST k =
-	// LARGEST j on equal f, and the deque pops >= from the back, so among
-	// equal minima only the newest (largest) j survives. The deque lives per
-	// zero run (zrun resets empty it); within a run the window's lower bound
-	// is monotone, so front pops are sound.
-	var dq: [MAX_CL_SEQ + 1]u32 = undefined; // j values, f[dq] strictly increasing
-	var dq_head: usize = 0;
-	var dq_tail: usize = 0;
-	for (1..n + 1) |i| {
-		const v = seq[i - 1];
-		if (v != 0) {
-			dq_head = 0; // zero run broken: window dead until the next run
-			dq_tail = 0;
-		}
-		var best = f[i - 1] + cost[v];
-		var kind: deflasm.ClKind = .lit;
-		var kk: u16 = v;
-		// rep16: elements i-k..i-1 must equal seq[i-k-1] → run spans >= k+1.
-		// (<= 4 candidates; run-constrained window, not worth a deque)
-		const kmax16: usize = @min(6, if (run[i] > 0) run[i] - 1 else 0);
-		var k: usize = 3;
-		while (k <= kmax16) : (k += 1) {
-			const c = f[i - k] + c16;
-			if (c < best) {
-				best = c;
-				kind = .rep16;
-				kk = @intCast(k);
-			}
-		}
-		if (zrun[i] > 0) {
-			const kmax17: usize = @min(10, zrun[i]);
-			k = 3;
-			while (k <= kmax17) : (k += 1) {
-				const c = f[i - k] + c17;
-				if (c < best) {
-					best = c;
-					kind = .rep17;
-					kk = @intCast(k);
-				}
-			}
-			if (zrun[i] >= 11) {
-				// k=11 newly valid here: push its j = i-11 (one new candidate
-				// per position; consecutive positions push consecutive j's).
-				const j_new: u32 = @intCast(i - 11);
-				while (dq_tail > dq_head and f[dq[dq_tail - 1]] >= f[j_new]) dq_tail -= 1;
-				dq[dq_tail] = j_new;
-				dq_tail += 1;
-				// Window lower bound: j >= i - min(138, zrun). Never empties
-				// the deque: the just-pushed j_new = i-11 >= j_lo always.
-				const j_lo = i - @min(138, zrun[i]);
-				while (dq[dq_head] < j_lo) dq_head += 1;
-				const jmin = dq[dq_head];
-				const c = f[jmin] + c18;
-				if (c < best) {
-					best = c;
-					kind = .rep18;
-					kk = @intCast(i - jmin);
-				}
-			}
-		}
-		f[i] = best;
-		ch_kind[i] = kind;
-		ch_k[i] = kk;
-	}
-	// Reconstruct (reversed), then append in order.
-	var rev: [MAX_CL_SEQ]ClEntry = undefined;
-	var nrev: usize = 0;
-	var i: usize = n;
-	while (i > 0) {
-		const kind = ch_kind[i];
-		rev[nrev] = .{ .kind = kind, .val = ch_k[i] };
-		nrev += 1;
-		i -= if (kind == .lit) 1 else ch_k[i];
-	}
-	try entries.ensureUnusedCapacity(alloc, nrev);
-	var j: usize = nrev;
-	while (j > 0) {
-		j -= 1;
-		entries.appendAssumeCapacity(rev[j]);
-	}
-}
-
-pub const BuiltCl = struct {
-	entries: std.ArrayList(ClEntry),
-	cl_lengths: [19]u8,
-	header_bits: i64,
-};
 
 test "distance floor: built trees carry the configured codewords, inherited ones pass through" {
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -696,7 +72,7 @@ test "distance floor: built trees carry the configured codewords, inherited ones
 		try std.testing.expectEqual(@as(usize, 1), countNonzero(&d));
 	}
 
-	// Candidate sets per level and the trees makeDynamicBlock builds.
+	// Candidate sets per level and rebuilt trees.
 	var lits: [48]Token = undefined;
 	for (&lits, 0..) |*t, i| t.* = .{ .lit = @intCast(0x40 + i % 16) };
 	var single: [52]Token = undefined;
@@ -707,13 +83,13 @@ test "distance floor: built trees carry the configured codewords, inherited ones
 	for (single[48..]) |*t| t.* = .{ .match = .{ .length = 3, .distance = 5 } };
 	for ([_]u8{ 0, 1, 2 }) |level| {
 		_ = swapMinDistCodes(level);
-		const cands = emptyDistCandidates();
+		const cands = encoding.emptyDistCandidates(min_dist_codes);
 		try std.testing.expectEqual(@as(usize, if (level == 0) 2 else 1), cands.len);
 		for (cands) |c| try std.testing.expect(countNonzero(c) >= level);
-		const m = (try makeDynamicBlock(a, &lits, true, false, false)).body.huff;
+		const m = (try encoder().complete(a, &lits, true, .{})).body.huff;
 		try std.testing.expect(countNonzero(m.dist_lengths) >= level);
 		try std.testing.expectEqual(@as(usize, if (level == 2) 2 else 1), m.dist_lengths.len);
-		const s = (try makeDynamicBlock(a, &single, true, false, false)).body.huff;
+		const s = (try encoder().complete(a, &single, true, .{})).body.huff;
 		try std.testing.expectEqual(@as(usize, if (level == 2) 2 else 1), countNonzero(s.dist_lengths));
 		try std.testing.expectEqual(@as(u8, 1), s.dist_lengths[4]);
 		try std.testing.expectEqual(@as(u8, if (level == 2) 1 else 0), s.dist_lengths[0]);
@@ -721,7 +97,7 @@ test "distance floor: built trees carry the configured codewords, inherited ones
 		try std.testing.expect(satisfiesDistFloor(.{ .is_last = true, .body = .{ .huff = s } }, .{ .is_last = true, .body = .{ .stored = "x" } }, level));
 	}
 	_ = swapMinDistCodes(2);
-	const hazard = (try makeDynamicBlock(a, &single, true, false, false)).body.huff;
+	const hazard = (try encoder().complete(a, &single, true, .{})).body.huff;
 	var lone = [_]u8{1};
 	var inherited = hazard;
 	inherited.dist_lengths = &lone;
@@ -804,54 +180,6 @@ fn countNonzero(lengths: []const u8) usize {
 	return n;
 }
 
-test "optimizer memo: exact CL keys, collisions, ownership and scope" {
-	const a = std.testing.allocator;
-	var arena = std.heap.ArenaAllocator.init(a);
-	defer arena.deinit();
-	const scratch = arena.allocator();
-	// One slot forces eviction on every distinct key.
-	var memo = try OptimizerMemo.init(a, 1);
-	defer memo.deinit();
-	const previous = swapOptimizerMemo(&memo);
-	defer _ = swapOptimizerMemo(previous);
-	var ll = [_]u8{0} ** (common.EOB + 1);
-	ll[65] = 1;
-	ll[common.EOB] = 1;
-	const dist = [_]u8{1};
-	for ([_]bool{ false, true }) |t24| {
-		cl_t24_arbitration = t24;
-		defer cl_t24_arbitration = false;
-		for ([_]bool{ false, true }) |pm| {
-			for ([_]bool{ false, true }) |crossing| {
-				const expected = try buildClUncached(scratch, &ll, &dist, pm, crossing);
-				const misses = memo.misses;
-				var first = try buildClImpl(scratch, &ll, &dist, pm, crossing);
-				try std.testing.expectEqual(misses + 1, memo.misses);
-				// A caller may mutate its materialized result; this must not
-				// corrupt the memo's owned copy or a later returned copy.
-				first.entries.items[0].val +%= 1;
-				const hits = memo.hits;
-				const second = try buildClImpl(scratch, &ll, &dist, pm, crossing);
-				try std.testing.expectEqual(hits + 1, memo.hits);
-				try std.testing.expectEqualDeep(expected.entries.items, second.entries.items);
-				try std.testing.expectEqual(expected.cl_lengths, second.cl_lengths);
-				try std.testing.expectEqual(expected.header_bits, second.header_bits);
-			}
-		}
-	}
-	// Same concatenated bytes but different section boundaries must miss.
-	const joined = [_]u8{ 1, 1, 1 };
-	_ = try buildClImpl(scratch, joined[0..2], joined[2..], true, false);
-	const misses = memo.misses;
-	_ = try buildClImpl(scratch, joined[0..1], joined[1..], true, false);
-	try std.testing.expectEqual(misses + 1, memo.misses);
-	try std.testing.expect(memo.evictions > 0);
-	try std.testing.expectEqual(&memo, swapOptimizerMemo(null).?);
-	_ = try buildClImpl(scratch, &ll, &dist, true, false);
-	try std.testing.expectEqual(misses + 1, memo.misses);
-	try std.testing.expectEqual(@as(?*OptimizerMemo, null), swapOptimizerMemo(&memo));
-}
-
 test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
@@ -919,103 +247,7 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 }
 
 
-/// Greedy CL encoding used as the search-time cost model in optDynamic.
-/// Its overestimates encourage different expansion paths from the exact
-/// model. Materialization always uses buildCl.
-fn buildClGreedy(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_lengths: []const u8) !BuiltCl {
-	var entries: std.ArrayList(ClEntry) = .empty;
-	try genClEntries(alloc, ll_lengths, &entries);
-	try entries.append(alloc, .{ .kind = .sep, .val = 0 });
-	try genClEntries(alloc, dist_lengths, &entries);
-	var freq = clFreqOf(entries.items);
-	var cl_lengths = [_]u8{0} ** 19;
-	freqToLengths(&freq, 7, &cl_lengths);
-	return .{
-		.entries = entries,
-		.cl_lengths = cl_lengths,
-		.header_bits = try clHeaderBits(&cl_lengths, entries.items),
-	};
-}
-
-/// Encode nonzero lengths literally and zero runs with rep17/18.
-/// This gives buildCl a seed without rep16.
-fn genClNorep16(
-	alloc: std.mem.Allocator,
-	lengths: []const u8,
-	entries: *std.ArrayList(ClEntry),
-) !void {
-	var i: usize = 0;
-	const len = lengths.len;
-	while (i < len) {
-		const v = lengths[i];
-		if (v == 0) {
-			var j = i;
-			while (j < len and lengths[j] == 0) j += 1;
-			var count: usize = j - i;
-			while (count > 0) {
-				if (count >= 11) {
-					const run = @min(count, 138);
-					try entries.append(alloc, .{ .kind = .rep18, .val = @intCast(run) });
-					count -= run;
-				} else if (count >= 3) {
-					const run = @min(count, 10);
-					try entries.append(alloc, .{ .kind = .rep17, .val = @intCast(run) });
-					count -= run;
-				} else {
-					try entries.append(alloc, .{ .kind = .lit, .val = 0 });
-					count -= 1;
-				}
-			}
-			i = j;
-		} else {
-			try entries.append(alloc, .{ .kind = .lit, .val = v });
-			i += 1;
-		}
-	}
-}
-
-/// Encode every length literally, including zeros. A sparse tree can then
-/// assign CL symbol 0 a one-bit code, reaching a fixed point that seeds
-/// using rep17/18 cannot reach.
-fn genClAllLiteral(
-	alloc: std.mem.Allocator,
-	lengths: []const u8,
-	entries: *std.ArrayList(ClEntry),
-) !void {
-	for (lengths) |v| {
-		try entries.append(alloc, .{ .kind = .lit, .val = v });
-	}
-}
-
-/// Encode runs using rep16 only, including runs of zero lengths. Together
-/// with the other seeds this covers rep16 on/off and rep17/18 on/off.
-fn genClNorep1718(
-	alloc: std.mem.Allocator,
-	lengths: []const u8,
-	entries: *std.ArrayList(ClEntry),
-) !void {
-	var i: usize = 0;
-	const len = lengths.len;
-	while (i < len) {
-		const v = lengths[i];
-		try entries.append(alloc, .{ .kind = .lit, .val = v });
-		i += 1;
-		var j = i;
-		while (j < len and lengths[j] == v and j - i < 6) j += 1;
-		var run: usize = j - i;
-		while (run >= 3) {
-			const r = @min(run, 6);
-			try entries.append(alloc, .{ .kind = .rep16, .val = @intCast(r) });
-			run -= r;
-			i += r;
-		}
-	}
-}
-
-/// Build CL encodings from multiple seeds, each followed by two DP rounds
-/// under the current CL tree. Keep the smallest header across all chains;
-/// different seeds can reach different fixed points.
-const ClModel = enum { greedy, full, search };
+const ClModel = encoding.Header;
 
 /// Enable the all-literal and rep16-only CL seeds during the second
 /// portfolio pass. The crossing chain always includes them. Thread-local
@@ -1044,19 +276,8 @@ pub fn minDistCodes() u8 {
 /// complete tree, so only the single-symbol case needs the filler. The
 /// filler's position is a materialization choice; the filler relocation move may
 /// then park the dead code wherever the CL header prices it cheapest.
-pub fn distFloor(dist_full: *[30]u8) void {
-	if (min_dist_codes < 2) return;
-	var used: ?usize = null;
-	var n: usize = 0;
-	for (dist_full, 0..) |l, i| {
-		if (l != 0) {
-			n += 1;
-			used = i;
-		}
-	}
-	if (n != 1) return;
-	dist_full[used.?] = 1;
-	dist_full[if (used.? == 0) 1 else 0] = 1;
+fn distFloor(dist_full: *[30]u8) void {
+	encoding.applyFloor(dist_full, min_dist_codes);
 }
 
 /// Scoped per CLI worker thread.
@@ -1189,26 +410,12 @@ pub const OptimizerMemo = struct {
 		result_dist_len: u16 = 0,
 		result: [320]u8 = undefined,
 	};
-	const Slot = struct {
-		valid: bool = false,
-		ll_len: u16 = 0,
-		dist_len: u16 = 0,
-		flags: u8 = 0,
-		lengths: [320]u8 = undefined,
-		entries: [321]ClEntry = undefined,
-		entry_count: u16 = 0,
-		cl_lengths: [19]u8 = undefined,
-		header_bits: i64 = 0,
-	};
 	allocator: std.mem.Allocator,
-	slots: []Slot,
+	encoding: encoding.Memo,
 	polish_slots: []PolishSlot,
 	stream_slots: []StreamSlot,
 	sweep_slots: []SweepSlot,
 	projection: ProjectionMemo,
-	hits: u64 = 0,
-	misses: u64 = 0,
-	evictions: u64 = 0,
 	polish_hits: u64 = 0,
 	polish_misses: u64 = 0,
 	portfolio_enabled: bool = true,
@@ -1219,8 +426,8 @@ pub const OptimizerMemo = struct {
 
 	pub fn init(allocator: std.mem.Allocator, capacity: usize) !OptimizerMemo {
 		if (capacity == 0) return error.InvalidCapacity;
-		const slots = try allocator.alloc(Slot, capacity);
-		errdefer allocator.free(slots);
+		var headers = try encoding.Memo.init(allocator, capacity);
+		errdefer headers.deinit();
 		const polish_slots = try allocator.alloc(PolishSlot, capacity);
 		errdefer allocator.free(polish_slots);
 		const stream_slots = try allocator.alloc(StreamSlot, @min(capacity, 16));
@@ -1228,15 +435,14 @@ pub const OptimizerMemo = struct {
 		const sweep_slots = try allocator.alloc(SweepSlot, @min(capacity, 1024));
 		for (sweep_slots) |*entry| entry.valid = false;
 		for (stream_slots) |*entry| entry.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
-		for (slots) |*entry| entry.valid = false;
 		for (polish_slots) |*entry| entry.valid = false;
-		return .{ .allocator = allocator, .slots = slots, .polish_slots = polish_slots, .stream_slots = stream_slots, .sweep_slots = sweep_slots,
+		return .{ .allocator = allocator, .encoding = headers, .polish_slots = polish_slots, .stream_slots = stream_slots, .sweep_slots = sweep_slots,
 			.projection = .{ .inputs = std.heap.ArenaAllocator.init(allocator), .arena = std.heap.ArenaAllocator.init(allocator) } };
 	}
 
 	pub fn deinit(self: *OptimizerMemo) void {
 		std.debug.assert(active_optimizer_memo != self);
-		self.allocator.free(self.slots);
+		self.encoding.deinit();
 		self.allocator.free(self.polish_slots);
 		for (self.stream_slots) |*entry| entry.arena.deinit();
 		self.allocator.free(self.stream_slots);
@@ -1245,16 +451,8 @@ pub const OptimizerMemo = struct {
 		self.* = undefined;
 	}
 
-	fn slot(self: *OptimizerMemo, ll: []const u8, dist: []const u8, flags: u8) *Slot {
-		var hash = std.hash.Wyhash.init(0);
-		hash.update(&.{ @intCast(ll.len & 255), @intCast(ll.len >> 8), @intCast(dist.len), flags });
-		hash.update(ll);
-		hash.update(dist);
-		return &self.slots[hash.final() % self.slots.len];
-	}
-
 	pub fn storageBytes(self: *const OptimizerMemo) usize {
-		var bytes = self.slots.len * @sizeOf(Slot) + self.polish_slots.len * @sizeOf(PolishSlot) + self.stream_slots.len * @sizeOf(StreamSlot) + self.sweep_slots.len * @sizeOf(SweepSlot);
+		var bytes = self.encoding.storageBytes() + self.polish_slots.len * @sizeOf(PolishSlot) + self.stream_slots.len * @sizeOf(StreamSlot) + self.sweep_slots.len * @sizeOf(SweepSlot);
 		for (self.stream_slots) |entry| bytes += entry.arena.queryCapacity();
 		bytes += self.projection.inputs.queryCapacity() + self.projection.arena.queryCapacity();
 		return bytes;
@@ -1290,21 +488,22 @@ pub fn swapOptimizerMemo(next: ?*OptimizerMemo) ?*OptimizerMemo {
 	return previous;
 }
 
-pub fn buildCl(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_lengths: []const u8) !BuiltCl {
-	return buildClImpl(alloc, ll_lengths, dist_lengths, true, false);
+pub fn encoder() encoding.Builder {
+	return .{ .floor = min_dist_codes, .extra_seeds = cl_t24_arbitration,
+		.memo = if (active_optimizer_memo) |m| &m.encoding else null };
 }
 
-/// Search cost model using buildCl without its package-merge chain.
-/// Search and final materialization deliberately use different models.
-pub fn buildClSearch(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_lengths: []const u8) !BuiltCl {
-	return buildClImpl(alloc, ll_lengths, dist_lengths, false, false);
+fn buildCl(a: std.mem.Allocator, ll: []const u8, dist: []const u8) !encoding.BuiltCl {
+	return encoder().header(a, ll, dist, .full);
 }
-
-/// Build CL encodings including repeats across the literal/distance boundary.
-/// Used for strict-gain polishing after choosing a winner. Including this
-/// chain in arbitration changes the candidates that reach later transforms.
-pub fn buildClCrossing(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_lengths: []const u8) !BuiltCl {
-	return buildClImpl(alloc, ll_lengths, dist_lengths, true, true);
+fn buildClCrossing(a: std.mem.Allocator, ll: []const u8, dist: []const u8) !encoding.BuiltCl {
+	return encoder().header(a, ll, dist, .crossing);
+}
+fn emptyDistCl(a: std.mem.Allocator, ll: []const u8, mode: encoding.Header) !encoding.DistanceHeader {
+	return encoder().empty(a, ll, mode);
+}
+fn dynCostFromFreqs(a: std.mem.Allocator, ll: []const u32, dist: []const u32, extra: i64, mode: encoding.Header) !i64 {
+	return encoder().costFromFreqs(a, ll, dist, extra, mode);
 }
 
 const ClCost = struct { header_bits: i64, cl_lengths: [19]u8 };
@@ -1315,384 +514,6 @@ fn buildClCost(scratch: *std.heap.ArenaAllocator, ll_lengths: []const u8, dist_l
 	defer _ = scratch.reset(SCRATCH_RESET);
 	const built = try buildCl(scratch.allocator(), ll_lengths, dist_lengths);
 	return .{ .header_bits = built.header_bits, .cl_lengths = built.cl_lengths };
-}
-
-fn buildClImpl(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_lengths: []const u8, pm_chain: bool, crossing: bool) !BuiltCl {
-	if (active_optimizer_memo) |memo| {
-		// These bounds cover fixed and dynamic DEFLATE alphabets. Larger
-		// internal/test inputs retain the uncached builder's behavior.
-		if (ll_lengths.len <= 288 and dist_lengths.len <= 32) {
-			const flags: u8 = @as(u8, @intFromBool(pm_chain)) | (@as(u8, @intFromBool(crossing)) << 1) | (@as(u8, @intFromBool(cl_t24_arbitration)) << 2);
-			const slot = memo.slot(ll_lengths, dist_lengths, flags);
-			if (slot.valid and slot.ll_len == ll_lengths.len and slot.dist_len == dist_lengths.len and slot.flags == flags and
-				std.mem.eql(u8, slot.lengths[0..ll_lengths.len], ll_lengths) and
-				std.mem.eql(u8, slot.lengths[ll_lengths.len..][0..dist_lengths.len], dist_lengths))
-			{
-				memo.hits += 1;
-				return .{ .entries = .fromOwnedSlice(try alloc.dupe(ClEntry, slot.entries[0..slot.entry_count])), .cl_lengths = slot.cl_lengths, .header_bits = slot.header_bits };
-			}
-			memo.misses += 1;
-			const built = try buildClUncached(alloc, ll_lengths, dist_lengths, pm_chain, crossing);
-			if (built.entries.items.len <= slot.entries.len) {
-				if (slot.valid) memo.evictions += 1;
-				slot.valid = true;
-				slot.ll_len = @intCast(ll_lengths.len);
-				slot.dist_len = @intCast(dist_lengths.len);
-				slot.flags = flags;
-				@memcpy(slot.lengths[0..ll_lengths.len], ll_lengths);
-				@memcpy(slot.lengths[ll_lengths.len..][0..dist_lengths.len], dist_lengths);
-				slot.entry_count = @intCast(built.entries.items.len);
-				@memcpy(slot.entries[0..slot.entry_count], built.entries.items);
-				slot.cl_lengths = built.cl_lengths;
-				slot.header_bits = built.header_bits;
-			}
-			return built;
-		}
-	}
-	return buildClUncached(alloc, ll_lengths, dist_lengths, pm_chain, crossing);
-}
-
-fn buildClUncached(alloc: std.mem.Allocator, ll_lengths: []const u8, dist_lengths: []const u8, pm_chain: bool, crossing: bool) !BuiltCl {
-	var best: ?BuiltCl = null;
-	// The additional CL seeds (all-literal, rep16-only) join the arbitrating
-	// builders only under the union driver's second pass
-	// (cl_t24_arbitration); the pm_chain=false search cost model never
-	// sees them.
-	const n_seeds: usize = if (pm_chain and cl_t24_arbitration) 4 else 2;
-	for (0..n_seeds) |seed_i| {
-		var entries: std.ArrayList(ClEntry) = .empty;
-		if (seed_i == 0) {
-			try genClEntries(alloc, ll_lengths, &entries);
-			try entries.append(alloc, .{ .kind = .sep, .val = 0 });
-			try genClEntries(alloc, dist_lengths, &entries);
-		} else if (seed_i == 1) {
-			try genClNorep16(alloc, ll_lengths, &entries);
-			try entries.append(alloc, .{ .kind = .sep, .val = 0 });
-			try genClNorep16(alloc, dist_lengths, &entries);
-		} else if (seed_i == 2) {
-			try genClAllLiteral(alloc, ll_lengths, &entries);
-			try entries.append(alloc, .{ .kind = .sep, .val = 0 });
-			try genClAllLiteral(alloc, dist_lengths, &entries);
-		} else {
-			try genClNorep1718(alloc, ll_lengths, &entries);
-			try entries.append(alloc, .{ .kind = .sep, .val = 0 });
-			try genClNorep1718(alloc, dist_lengths, &entries);
-		}
-		var cur_freq = clFreqOf(entries.items);
-		var cur_lengths = [_]u8{0} ** 19;
-		freqToLengths(&cur_freq, 7, &cur_lengths);
-		const seed_cost = try clHeaderBits(&cur_lengths, entries.items);
-		if (best == null or seed_cost < best.?.header_bits) {
-			best = .{ .entries = entries, .cl_lengths = cur_lengths, .header_bits = seed_cost };
-		}
-		for (0..2) |_| {
-			var e2: std.ArrayList(ClEntry) = .empty;
-			try dpClSection(alloc, ll_lengths, &cur_lengths, &e2);
-			try e2.append(alloc, .{ .kind = .sep, .val = 0 });
-			try dpClSection(alloc, dist_lengths, &cur_lengths, &e2);
-			cur_freq = clFreqOf(e2.items);
-			cur_lengths = [_]u8{0} ** 19;
-			freqToLengths(&cur_freq, 7, &cur_lengths);
-			const cost = try clHeaderBits(&cur_lengths, e2.items);
-			if (cost < best.?.header_bits) {
-				best = .{ .entries = e2, .cl_lengths = cur_lengths, .header_bits = cost };
-			}
-		}
-	}
-	// Package-merge chain: start with all lengths five, then rebuild from
-	// DP usage counts until a fixed point.
-	if (!pm_chain) return best.?;
-	{
-		var cur_lengths = [_]u8{0} ** 19;
-		for (ll_lengths) |v| cur_lengths[v] = 5;
-		for (dist_lengths) |v| cur_lengths[v] = 5;
-		cur_lengths[16] = 5;
-		cur_lengths[17] = 5;
-		cur_lengths[18] = 5;
-		var prev = [_]u8{0} ** 19;
-		var have_prev = false;
-		for (0..6) |_| {
-			var e2: std.ArrayList(ClEntry) = .empty;
-			try dpClSection(alloc, ll_lengths, &cur_lengths, &e2);
-			try e2.append(alloc, .{ .kind = .sep, .val = 0 });
-			try dpClSection(alloc, dist_lengths, &cur_lengths, &e2);
-			const cur_freq = clFreqOf(e2.items);
-			cur_lengths = packageMergeCl(&cur_freq);
-			const cost = try clHeaderBits(&cur_lengths, e2.items);
-			if (cost < best.?.header_bits) {
-				best = .{ .entries = e2, .cl_lengths = cur_lengths, .header_bits = cost };
-			}
-			if (have_prev and std.mem.eql(u8, &cur_lengths, &prev)) break;
-			prev = cur_lengths;
-			have_prev = true;
-		}
-	}
-	// Encode the combined literal/length and distance sequence so repeats
-	// can cross its boundary, as RFC 1951 section 3.2.7 permits. This chain
-	// is used only for post-winner strict-gain polishing. Assembly derives
-	// HLIT/HDIST from the length arrays and ignores separator entries.
-	if (crossing) {
-		const combined = try std.mem.concat(alloc, u8, &.{ ll_lengths, dist_lengths });
-		for (0..4) |seed_i| {
-			var entries: std.ArrayList(ClEntry) = .empty;
-			if (seed_i == 0) {
-				try genClEntries(alloc, combined, &entries);
-			} else if (seed_i == 1) {
-				try genClNorep16(alloc, combined, &entries);
-			} else if (seed_i == 2) {
-				try genClAllLiteral(alloc, combined, &entries);
-			} else {
-				try genClNorep1718(alloc, combined, &entries);
-			}
-			var cur_entries = entries;
-			var cur_freq = clFreqOf(cur_entries.items);
-			var cur_lengths = [_]u8{0} ** 19;
-			freqToLengths(&cur_freq, 7, &cur_lengths);
-			for (0..3) |_| {
-				const cost = try clHeaderBits(&cur_lengths, cur_entries.items);
-				if (cost < best.?.header_bits) {
-					best = .{ .entries = cur_entries, .cl_lengths = cur_lengths, .header_bits = cost };
-				}
-				var e2: std.ArrayList(ClEntry) = .empty;
-				try dpClSection(alloc, combined, &cur_lengths, &e2);
-				if (clEntriesEql(cur_entries.items, e2.items)) break;
-				cur_entries = e2;
-				cur_freq = clFreqOf(cur_entries.items);
-				cur_lengths = [_]u8{0} ** 19;
-				freqToLengths(&cur_freq, 7, &cur_lengths);
-			}
-		}
-	}
-	return best.?;
-}
-
-fn clEntriesEql(a: []const ClEntry, b: []const ClEntry) bool {
-	if (a.len != b.len) return false;
-	for (a, b) |x, y| {
-		if (x.kind != y.kind or x.val != y.val) return false;
-	}
-	return true;
-}
-
-/// Optimal length-limited CL lengths via package-merge. Order items by
-/// (weight, id): leaves in (frequency, symbol) order, then packages in
-/// creation order. Count each symbol's occurrences among the first 2n-2
-/// items of the final pool to obtain its length.
-fn packageMergeCl(freq: *const [19]u32) [19]u8 {
-	var lengths = [_]u8{0} ** 19;
-	var syms_buf: [19]u8 = undefined;
-	var n: usize = 0;
-	for (0..19) |s| {
-		if (freq[s] > 0) {
-			syms_buf[n] = @intCast(s);
-			n += 1;
-		}
-	}
-	if (n == 0) return lengths;
-	if (n == 1) {
-		lengths[syms_buf[0]] = 1;
-		return lengths;
-	}
-	// sort leaves by (freq, sym) ascending
-	var q: usize = 1;
-	while (q < n) : (q += 1) {
-		const s = syms_buf[q];
-		var r = q;
-		while (r > 0 and (freq[syms_buf[r - 1]] > freq[s] or
-				(freq[syms_buf[r - 1]] == freq[s] and syms_buf[r - 1] > s))) : (r -= 1) {
-			syms_buf[r] = syms_buf[r - 1];
-		}
-		syms_buf[r] = s;
-	}
-	const Item = struct { w: u64, id: u32, counts: [19]u8 };
-	// capacities: leaves n<=19; packages per round <= (leaves+packages)/2;
-	// bounded by 19 + 18 = 37 pool, 18 packages — round up generously.
-	var leaves: [19]Item = undefined;
-	for (0..n) |i| {
-		var c = [_]u8{0} ** 19;
-		c[syms_buf[i]] = 1;
-		leaves[i] = .{ .w = freq[syms_buf[i]], .id = @intCast(i), .counts = c };
-	}
-	var next_id: u32 = @intCast(n);
-	var packages: [40]Item = undefined;
-	var npkg: usize = 0;
-	var pool: [64]Item = undefined;
-	for (0..6) |_| { // max_bits - 1 = 6 rounds
-		var np: usize = 0;
-		for (leaves[0..n]) |it| {
-			pool[np] = it;
-			np += 1;
-		}
-		for (packages[0..npkg]) |it| {
-			pool[np] = it;
-			np += 1;
-		}
-		// insertion sort by (w, id)
-		var a: usize = 1;
-		while (a < np) : (a += 1) {
-			const it = pool[a];
-			var b = a;
-			while (b > 0 and (pool[b - 1].w > it.w or
-					(pool[b - 1].w == it.w and pool[b - 1].id > it.id))) : (b -= 1) {
-				pool[b] = pool[b - 1];
-			}
-			pool[b] = it;
-		}
-		npkg = 0;
-		var i: usize = 0;
-		while (i + 1 < np) : (i += 2) {
-			var c = pool[i].counts;
-			for (0..19) |s| c[s] += pool[i + 1].counts[s];
-			packages[npkg] = .{ .w = pool[i].w + pool[i + 1].w, .id = next_id, .counts = c };
-			next_id += 1;
-			npkg += 1;
-		}
-	}
-	var np: usize = 0;
-	for (leaves[0..n]) |it| {
-		pool[np] = it;
-		np += 1;
-	}
-	for (packages[0..npkg]) |it| {
-		pool[np] = it;
-		np += 1;
-	}
-	var a: usize = 1;
-	while (a < np) : (a += 1) {
-		const it = pool[a];
-		var b = a;
-		while (b > 0 and (pool[b - 1].w > it.w or
-				(pool[b - 1].w == it.w and pool[b - 1].id > it.id))) : (b -= 1) {
-			pool[b] = pool[b - 1];
-		}
-		pool[b] = it;
-	}
-	for (pool[0 .. 2 * n - 2]) |it| {
-		for (0..19) |s| lengths[s] += it.counts[s];
-	}
-	return lengths;
-}
-
-pub const EmptyDistCl = struct {
-	dist: []const u8, // static; dupe before storing in a block
-	built: BuiltCl,
-};
-
-const EMPTY_DIST_ZERO = [_]u8{0};
-const EMPTY_DIST_ONE = [_]u8{1};
-const EMPTY_DIST_COMPLETE = [_]u8{ 1, 1 };
-
-/// Distance trees a matchless block may carry under the current floor. Port
-/// of _empty_dist_cl's candidate set: at level 0 both RFC §3.2.7 dummies
-/// ([0] usually wins — CL symbol 1 sits second-to-last in the HCLEN
-/// permutation order — but swapping the dummy moves a count between CL
-/// symbols 0 and 1 and reshapes the CL tree, so neither dominates); level 1
-/// the single 1-bit code; level 2 the complete two-code tree.
-fn emptyDistCandidates() []const []const u8 {
-	return switch (min_dist_codes) {
-		0 => &.{ &EMPTY_DIST_ZERO, &EMPTY_DIST_ONE },
-		1 => &.{&EMPTY_DIST_ONE},
-		else => &.{&EMPTY_DIST_COMPLETE},
-	};
-}
-
-/// CL encoding for a matchless block. Evaluate every candidate distance tree
-/// the floor allows, keep the cheaper header; tie prefers the earlier
-/// candidate ([0] at level 0).
-pub fn emptyDistCl(alloc: std.mem.Allocator, ll_lengths: []const u8, cl_model: ClModel) !EmptyDistCl {
-	var best: ?EmptyDistCl = null;
-	for (emptyDistCandidates()) |dl| {
-		const built = switch (cl_model) {
-			.greedy => try buildClGreedy(alloc, ll_lengths, dl),
-			.full => try buildCl(alloc, ll_lengths, dl),
-			.search => try buildClSearch(alloc, ll_lengths, dl),
-		};
-		if (best == null or built.header_bits < best.?.built.header_bits) {
-			best = .{ .dist = dl, .built = built };
-		}
-	}
-	return best.?;
-}
-
-/// Dynamic-block cost from frequency tables and precomputed extra bits.
-/// ll_freq has 286 slots, dist_freq 30.
-fn dynCostFromFreqs(
-	alloc: std.mem.Allocator,
-	ll_freq: []const u32,
-	dist_freq: []const u32,
-	extra_bits: i64,
-	cl_model: ClModel,
-) !i64 {
-	var ll_full = [_]u8{0} ** 286;
-	freqToLengths(ll_freq, 15, &ll_full);
-	const ll_len = trimLen(&ll_full, common.EOB + 1);
-	const ll_lengths = ll_full[0..ll_len];
-
-	var dist_full = [_]u8{0} ** 30;
-	var any_dist = false;
-	for (dist_freq) |f| {
-		if (f > 0) any_dist = true;
-	}
-
-	var bits: i64 = undefined;
-	if (any_dist) {
-		freqToLengths(dist_freq, 15, &dist_full);
-		distFloor(&dist_full);
-		const dist_lengths = dist_full[0..trimLen(&dist_full, 1)];
-
-		const built = switch (cl_model) {
-			.greedy => try buildClGreedy(alloc, ll_lengths, dist_lengths),
-			.full => try buildCl(alloc, ll_lengths, dist_lengths),
-			.search => try buildClSearch(alloc, ll_lengths, dist_lengths),
-		};
-		bits = built.header_bits;
-
-		const dist_enc = common.HuffEnc(32).build(dist_lengths) orelse return error.Malformed;
-		for (dist_freq, 0..) |f, s| {
-			if (f > 0) bits += @as(i64, f) * dist_enc.len[s];
-		}
-	} else {
-		// Matchless: dist symbol cost is zero; header uses the cheaper dummy.
-		const e = try emptyDistCl(alloc, ll_lengths, cl_model);
-		bits = e.built.header_bits;
-	}
-
-	const ll_enc = common.HuffEnc(288).build(ll_lengths) orelse return error.Malformed;
-	for (ll_freq, 0..) |f, s| {
-		if (f > 0) bits += @as(i64, f) * ll_enc.len[s];
-	}
-	return bits + extra_bits;
-}
-
-/// Cost of a built dynamic Huff block from its own stored lengths/entries/
-/// tokens.
-fn dynBlockCost(h: Huff) !i64 {
-	var bits: i64 = @intCast(17 + deflasm.encodingHclen(h) * 3);
-	const cl_enc = common.HuffEnc(19).build(&h.cl_lengths) orelse return error.Malformed;
-	bits += clEntriesBits(&cl_enc, h.cl_entries);
-
-	const ll_enc = common.HuffEnc(288).build(h.ll_lengths) orelse return error.Malformed;
-	const dist_enc = common.HuffEnc(32).build(h.dist_lengths) orelse return error.Malformed;
-	if (ll_enc.len[common.EOB] == 0) return error.Malformed;
-
-	for (h.tokens) |tok| {
-		switch (tok) {
-			.lit => |b| bits += ll_enc.len[b],
-			.match => |m| {
-				var lc: usize = lenCodeTable[m.length].code;
-				var xn: i64 = lenCodeTable[m.length].extra;
-				if (lc == 285 and (ll_enc.len[285] == 0 or
-					(h.encoding != null and m.original_alt258 and ll_enc.len[284] > 0))) {
-					lc = 284;
-					xn = 5;
-				}
-				const dc = distCodeTable[m.distance].code;
-				bits += @as(i64, ll_enc.len[lc]) + xn +
-					@as(i64, dist_enc.len[dc]) + distCodeTable[m.distance].extra;
-			},
-		}
-	}
-	return bits + ll_enc.len[common.EOB];
 }
 
 fn fixedCost(tokens: []const Token, preserve_encoding: bool) i64 {
@@ -2482,86 +1303,6 @@ fn polishDpCostReference(seq: []const u8, clc: *const [19]i64, f: []i64) i64 {
 	return f[n];
 }
 
-const RunStep = struct { kind: deflasm.ClKind, count: u8 };
-const RunTable = struct { costs: [MAX_CL_SEQ + 1]u16, steps: [MAX_CL_SEQ + 1]RunStep };
-
-// A nonzero run starts with a literal; subsequent symbols can be literals
-// or rep16 chunks of 3..6. Only two prices matter, both in the range 1..8
-// before rep16's extra bits. Precompute every combination once at compile time.
-const nonzero_run_tables = blk: {
-	@setEvalBranchQuota(1000000);
-	var table = std.mem.zeroes([9][9]RunTable);
-	for (1..9) |literal| for (1..9) |r16| {
-		const t = &table[literal][r16];
-		const f = &t.costs;
-		for (1..MAX_CL_SEQ + 1) |n| {
-			var best = f[n - 1] + @as(u16, literal);
-			var step: RunStep = .{ .kind = .lit, .count = 1 };
-			var k: usize = 3;
-			while (k <= @min(6, n - 1)) : (k += 1) {
-				const cost = f[n - k] + @as(u16, r16 + 2);
-				if (cost < best) { best = cost; step = .{ .kind = .rep16, .count = @intCast(k) }; }
-			}
-			f[n] = best;
-			t.steps[n] = step;
-		}
-	};
-	break :blk table;
-};
-
-const ZeroRunMemo = struct { key: u16, table: RunTable };
-threadlocal var zero_run_used: [128]bool = @splat(false);
-threadlocal var zero_run_memo: [128]ZeroRunMemo = undefined;
-
-fn polishZeroRunCosts(clc: *const [19]i64) *const [MAX_CL_SEQ + 1]u16 {
-	return &zeroRunTable(@intCast(clc[0]), @intCast(clc[16]), @intCast(clc[17]), @intCast(clc[18])).costs;
-}
-
-fn zeroRunTable(l0: u16, r16: u16, r17: u16, r18: u16) *const RunTable {
-	std.debug.assert(l0 >= 1 and l0 <= 8 and r16 >= 1 and r16 <= 8 and r17 >= 1 and r17 <= 8 and r18 >= 1 and r18 <= 8);
-	const c16 = r16 + 2;
-	const c17 = r17 + 3;
-	const c18 = r18 + 7;
-	const key: u16 = (l0 - 1) | ((c16 - 3) << 3) | ((c17 - 4) << 6) | ((c18 - 8) << 9);
-	const slot = (@as(u32, key) *% 2654435761) >> 25;
-	const entry = &zero_run_memo[slot];
-	if (zero_run_used[slot] and entry.key == key) return &entry.table;
-	const f = &entry.table.costs;
-	f[0] = 0;
-	var deque: [MAX_CL_SEQ + 1]usize = undefined;
-	var head: usize = 0;
-	var tail: usize = 0;
-	for (1..MAX_CL_SEQ + 1) |n| {
-		var best = f[n - 1] + l0;
-		var step: RunStep = .{ .kind = .lit, .count = 1 };
-		var k: usize = 3;
-		while (k <= @min(6, n - 1)) : (k += 1) {
-			const cost = f[n - k] + c16;
-			if (cost < best) { best = cost; step = .{ .kind = .rep16, .count = @intCast(k) }; }
-		}
-		k = 3;
-		while (k <= @min(10, n)) : (k += 1) {
-			const cost = f[n - k] + c17;
-			if (cost < best) { best = cost; step = .{ .kind = .rep17, .count = @intCast(k) }; }
-		}
-		if (n >= 11) {
-			const next = n - 11;
-			while (tail > head and f[deque[tail - 1]] >= f[next]) tail -= 1;
-			deque[tail] = next;
-			tail += 1;
-			const lo = n - @min(138, n);
-			while (deque[head] < lo) head += 1;
-			const cost = f[deque[head]] + c18;
-			if (cost < best) { best = cost; step = .{ .kind = .rep18, .count = @intCast(n - deque[head]) }; }
-		}
-		f[n] = best;
-		entry.table.steps[n] = step;
-	}
-	entry.key = key;
-	zero_run_used[slot] = true;
-	return &entry.table;
-}
-
 /// Exact fixed-price DP cost factored over maximal equal-value runs. No
 /// repeat can cross a run boundary, and rep16 requires a preceding value
 /// inside its run. Thus each run's optimum is independent. This changes
@@ -2569,23 +1310,21 @@ fn zeroRunTable(l0: u16, r16: u16, r17: u16, r18: u16) *const RunTable {
 fn polishDpCost(seq: []const u8, clc: *const [19]i64) i64 {
 	std.debug.assert(seq.len <= MAX_CL_SEQ);
 	for (clc) |price| std.debug.assert(price >= 1 and price <= 8);
-	const zero = polishZeroRunCosts(clc);
-	const r16: usize = @intCast(clc[16]);
+	
 	var total: i64 = 0;
 	var i: usize = 0;
 	while (i < seq.len) {
 		const v = seq[i];
 		var j = i + 1;
 		while (j < seq.len and seq[j] == v) j += 1;
-		total += if (v == 0) zero[j - i] else nonzero_run_tables[@intCast(clc[v])][r16].costs[j - i];
+		total += encoding.runCosts(v, clc)[j - i];
 		i = j;
 	}
 	return total;
 }
 
 fn polishExactRunBits(v: u8, count: u32, clc: *const [19]i64) i64 {
-	return if (v == 0) polishZeroRunCosts(clc)[count]
-		else nonzero_run_tables[@intCast(clc[v])][@intCast(clc[16])].costs[count];
+	return encoding.runCosts(v, clc)[count];
 }
 
 test "polish run costs: exhaustive prices and short sequences match DP" {
@@ -2600,7 +1339,7 @@ test "polish run costs: exhaustive prices and short sequences match DP" {
 		clc[17] = @intCast(r17);
 		clc[18] = @intCast(r18);
 		_ = polishDpCostReference(&seq, &clc, &reference);
-		const costs = polishZeroRunCosts(&clc);
+		const costs = encoding.runCosts(0, &clc);
 		for (reference, costs) |want, got| try std.testing.expectEqual(want, @as(i64, got));
 	};
 	// All nonzero literal/repeat price pairs, including rep16's mandatory
@@ -2610,7 +1349,7 @@ test "polish run costs: exhaustive prices and short sequences match DP" {
 		clc[1] = @intCast(literal);
 		clc[16] = @intCast(r16);
 		_ = polishDpCostReference(&seq, &clc, &reference);
-		for (reference, nonzero_run_tables[literal][r16].costs) |want, got| try std.testing.expectEqual(want, @as(i64, got));
+		for (reference, encoding.runCosts(1, &clc)) |want, got| try std.testing.expectEqual(want, @as(i64, got));
 	};
 	// Exhaustive ternary sequences through length 8 exercise run boundaries,
 	// with independent varying prices for zeros and both nonzero values.
@@ -3268,9 +2007,9 @@ const ExactFound = struct { is_ll: bool, sv: []u8, dp: i64, total: i64 };
 /// Compare same-depth triples by exact cost: literal/length then distance,
 /// ascending depth, forward before inverse, x1 before x2. Accept strict gains.
 fn polishExactPass(alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAllocator, ll: []u8, dist: []u8, llf: []const u32, df: []const u32, cur_dp: i64) !?ExactFound {
-	const tl = trimLen(ll, common.EOB + 1);
-	const td = trimLen(dist, 1);
-	var built = try buildClCost(cost_scratch, ll[0..tl], dist[0..td]);
+	const tl = trim(ll, common.EOB + 1);
+	const td = trim(dist, 1);
+	var built = try buildClCost(cost_scratch, tl, td);
 	const base_total = built.header_bits + cur_dp;
 	var best: ?ExactFound = null;
 	const sections = [2]struct { is_ll: bool, seq: []u8, freqs: []const u32 }{
@@ -3299,11 +2038,11 @@ fn polishExactPass(alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAlloca
 					for (sec.freqs, sv, sec.seq) |f, nv, ov| {
 						if (nv != ov) dp += @as(i64, f) * (@as(i64, nv) - ov);
 					}
-					const ta = trimLen(sv, if (sec.is_ll) common.EOB + 1 else 1);
+					const ta = trim(sv, if (sec.is_ll) common.EOB + 1 else 1);
 					built = if (sec.is_ll)
-						try buildClCost(cost_scratch, sv[0..ta], dist[0..td])
+						try buildClCost(cost_scratch, ta, td)
 					else
-						try buildClCost(cost_scratch, ll[0..tl], sv[0..ta]);
+						try buildClCost(cost_scratch, tl, ta);
 					const total = built.header_bits + dp;
 					if (total < base_total and (best == null or total < best.?.total)) {
 						best = .{ .is_ll = sec.is_ll, .sv = sv, .dp = dp, .total = total };
@@ -3453,15 +2192,15 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 					improved = improved or res2.improved;
 				}
 			}
-			const tl = trimLen(ll, common.EOB + 1);
-			const td = trimLen(dist, 1);
-			built = try buildClCost(&cost_scratch, ll[0..tl], dist[0..td]);
+			const tl = trim(ll, common.EOB + 1);
+			const td = trim(dist, 1);
+			built = try buildClCost(&cost_scratch, tl, td);
 			const ex = built.header_bits;
 			clc = try polishClCosts(&built.cl_lengths);
 			if (ex + cur_dp < best_total) {
 				best_total = ex + cur_dp;
-				best_ll = try alloc.dupe(u8, ll[0..tl]);
-				best_dist = try alloc.dupe(u8, dist[0..td]);
+				best_ll = try alloc.dupe(u8, tl);
+				best_dist = try alloc.dupe(u8, td);
 			}
 			if (!improved) break;
 		}
@@ -3474,8 +2213,8 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 		cur_dp = found.dp;
 		if (found.total < best_total) {
 			best_total = found.total;
-			best_ll = try alloc.dupe(u8, ll[0..trimLen(ll, common.EOB + 1)]);
-			best_dist = try alloc.dupe(u8, dist[0..trimLen(dist, 1)]);
+			best_ll = try alloc.dupe(u8, trim(ll, common.EOB + 1));
+			best_dist = try alloc.dupe(u8, trim(dist, 1));
 		}
 	}
 	if (best_ll == null) return null;
@@ -3602,7 +2341,7 @@ fn jointDescent(alloc: std.mem.Allocator, seed: Huff, orig_tokens: []const Token
 		};
 		var it_blk = kept;
 		var it_cost = try dynBlockCost(kept);
-		const canon = (try makeDynamicBlock(alloc, S, false, false, false)).body.huff;
+		const canon = (try encoder().complete(alloc, S, false, .{})).body.huff;
 		const cc = try dynBlockCost(canon);
 		if (cc < it_cost) {
 			it_blk = canon;
@@ -3779,7 +2518,7 @@ test "caller memo preserves block results across warm calls and changed history"
 		};
 		defer for (&states) |*state| state.deinit();
 		const a = arena.allocator();
-		const block = try makeDynamicBlock(a, &references, true, false, false);
+		const block = try encoder().complete(a, &references, true, .{});
 		const old = swapOptimizerMemo(null);
 		defer _ = swapOptimizerMemo(old);
 		const cold = try optimizeBlock(a, &sub, &states, block, prior);
@@ -3903,7 +2642,7 @@ const ReparseContext = struct {
 			const state = try blockFromBytes(ra, current);
 			if (state.body != .huff) break;
 			const h = state.body.huff;
-			const prices = try reparse.prices(ra, h, .{}, 0, @splat(false));
+			const prices = try reparse.prices(encoder(), ra, h, .{}, 0, @splat(false));
 			const parsed = reparse.parse(ra, self.graph, prices) catch |err| switch (err) {
 				error.NonFiniteCost => @panic("finite scale-zero reparse costs overflowed"),
 				error.OutOfMemory => return error.OutOfMemory,
@@ -3915,7 +2654,10 @@ const ReparseContext = struct {
 			var chosen_bytes: []const u8 = &.{};
 			var costs: [2][3]i64 = .{ .{ 0, 0, 0 }, .{ 0, 0, 0 } };
 			for (0..nvariants) |v| {
-				const variant = try reparse.materialize(ra, parsed.tokens, if (v == 0) null else h, seed.is_last);
+				const variant = try encoder().complete(ra, parsed.tokens, seed.is_last, .{
+					.trees = if (v == 0) .{ .fresh = .standard } else .{ .merge = .{ .previous = h } },
+					.header = if (v == 0) .full else .crossing,
+				});
 				const vbytes = try blockBytes(ra, variant);
 				const polished = try self.polishEncodedGrade(ra, vbytes, er.grade);
 				const cost = try blockCost(polished);
@@ -3979,7 +2721,7 @@ fn satisfiesDistFloor(result: Block, input: Block, want: u8) bool {
 	if (h.is_fixed) return true;
 	if (input.body == .huff and !input.body.huff.is_fixed) {
 		const kept = input.body.huff.dist_lengths;
-		if (std.mem.eql(u8, kept[0..trimLen(kept, 0)], h.dist_lengths[0..trimLen(h.dist_lengths, 0)])) return true;
+		if (std.mem.eql(u8, trim(kept, 0), trim(h.dist_lengths, 0))) return true;
 	}
 	var n: usize = 0;
 	for (h.dist_lengths) |l| {
@@ -4007,7 +2749,7 @@ fn repairDistFloor(alloc: std.mem.Allocator, result: Block, want: u8) !Block {
 		distFloor(&full);
 	}
 	std.debug.assert(countNonzero(&full) >= want);
-	h.dist_lengths = try alloc.dupe(u8, full[0..trimLen(&full, 1)]);
+	h.dist_lengths = try alloc.dupe(u8, trim(&full, 1));
 	const built = try buildCl(alloc, h.ll_lengths, h.dist_lengths);
 	h.cl_lengths = built.cl_lengths;
 	h.cl_entries = built.entries.items;
@@ -4092,7 +2834,7 @@ fn optimizeBlockAt(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, stat
 		var candidate_cost = try blockCost(candidate);
 		if (candidate_cost > cost) @panic("reparse search grew its seed");
 		if (candidate_cost == cost) {
-			candidate = try feedback.run(winners[next].allocator(), candidate, ctx.graph, &ctx, selected_feedback);
+			candidate = try feedback.run(winners[next].allocator(), candidate, ctx.graph, encoder(), &ctx, selected_feedback);
 			candidate_cost = try blockCost(candidate);
 			if (candidate_cost > cost) @panic("feedback search grew its incumbent");
 			if (candidate_cost == cost) break;
@@ -4220,12 +2962,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 			ns += 1;
 		}
 	}
-	const Routing = struct { drop: bool, unit: bool };
-	const all_routings = [_]Routing{
-		.{ .drop = false, .unit = false },
-		.{ .drop = true, .unit = false },
-		.{ .drop = true, .unit = true },
-	};
+	const all_routings = [_]encoding.Length258{ .standard, .alternate, .alternate_unit };
 	var dyn_blk: Block = undefined;
 	var dyn_cost: i64 = std.math.maxInt(i64);
 	for (streams[0..ns]) |toks| {
@@ -4238,7 +2975,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 		};
 		const n_rt: usize = if (has258) all_routings.len else 1;
 		for (all_routings[0..n_rt]) |rt| {
-			const cand = try makeDynamicBlock(alloc, toks, block.is_last, rt.drop, rt.unit);
+			const cand = try encoder().complete(alloc, toks, block.is_last, .{ .trees = .{ .fresh = rt } });
 			const cost = try dynBlockCost(cand.body.huff);
 			if (cost < dyn_cost) {
 				dyn_blk = cand;
@@ -4308,7 +3045,7 @@ test "stream portfolio memo isolates mode keys history and caller ownership" {
 		for ([_]bool{ false, true }) |last| {
 			for ([_]bool{ false, true }) |spelling| {
 				tokens[1].match.original_alt258 = spelling;
-				const block = try makeDynamicBlock(a, &tokens, last, false, false);
+				const block = try encoder().complete(a, &tokens, last, .{});
 				const pc = try precomputeMatchLits(a, &tokens, try ir.Program.decode(a, block, &.{}));
 				const expected = try buildStreamPortfolio(a, block, pc);
 				const misses = memo.portfolio_misses;
@@ -4326,7 +3063,7 @@ test "stream portfolio memo isolates mode keys history and caller ownership" {
 	// History matters through the expanded bytes. Same tokens with different
 	// expansions must miss; repeated reads and irrelevant history must hit.
 	const references = [_]Token{.{ .match = .{ .length = 3, .distance = 1 } }};
-	const block = try makeDynamicBlock(a, &references, true, false, false);
+	const block = try encoder().complete(a, &references, true, .{});
 	const hits = memo.portfolio_hits;
 	for ([_][]const u8{ "A", "B", "XA", "YA" }) |prior| {
 		const pc = try precomputeMatchLits(a, &references, try ir.Program.decode(a, block, prior));
@@ -4399,7 +3136,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 			break :blk .{ .block = fixedHuffBlock(fix.tokens, block.is_last), .raw = raw };
 		}
 		if (best == all_dyn_cost and all_dyn_cost <= dyn_cost) {
-			const all_dyn_blk = try makeDynamicBlock(alloc, try litTokens(alloc, raw), block.is_last, false, false);
+			const all_dyn_blk = try encoder().complete(alloc, try litTokens(alloc, raw), block.is_last, .{});
 			break :blk .{ .block = all_dyn_blk, .raw = raw };
 		}
 		break :blk .{ .block = dyn_blk, .raw = raw };
@@ -4524,8 +3261,8 @@ fn dupeBlock(a: std.mem.Allocator, b: Block) !Block {
 /// literal/length books cannot declare, so the two types cannot be identical.
 fn sameCodebooks(a: Huff, b: Huff) bool {
 	if (a.is_fixed or b.is_fixed) return a.is_fixed and b.is_fixed;
-	return std.mem.eql(u8, a.ll_lengths[0..trimLen(a.ll_lengths, 0)], b.ll_lengths[0..trimLen(b.ll_lengths, 0)]) and
-		std.mem.eql(u8, a.dist_lengths[0..trimLen(a.dist_lengths, 0)], b.dist_lengths[0..trimLen(b.dist_lengths, 0)]);
+	return std.mem.eql(u8, trim(a.ll_lengths, 0), trim(b.ll_lengths, 0)) and
+		std.mem.eql(u8, trim(a.dist_lengths, 0), trim(b.dist_lengths, 0));
 }
 
 test "codebook identity ignores header spelling but includes both alphabets" {
@@ -4533,7 +3270,7 @@ test "codebook identity ignores header spelling but includes both alphabets" {
 	defer arena.deinit();
 	const a = arena.allocator();
 	var tokens = [_]Token{ .{ .lit = 65 }, .{ .lit = 66 } };
-	const block = try makeDynamicBlock(a, &tokens, true, false, false);
+	const block = try encoder().complete(a, &tokens, true, .{});
 	const original = block.body.huff;
 	var padded = (try dupeBlock(a, block)).body.huff;
 	padded.ll_lengths = try a.alloc(u8, 286);
@@ -4542,7 +3279,7 @@ test "codebook identity ignores header spelling but includes both alphabets" {
 	@memset(padded.dist_lengths, 0);
 	@memcpy(padded.ll_lengths[0..original.ll_lengths.len], original.ll_lengths);
 	@memcpy(padded.dist_lengths[0..original.dist_lengths.len], original.dist_lengths);
-	const cl = try buildClGreedy(a, padded.ll_lengths, padded.dist_lengths);
+	const cl = try encoder().header(a, padded.ll_lengths, padded.dist_lengths, .greedy);
 	padded.cl_entries = cl.entries.items;
 	padded.cl_lengths = cl.cl_lengths;
 	padded.encoding = .{ .hclen = 19 };
@@ -4620,9 +3357,9 @@ const HuffmanRun = struct {
 		var block = self.header;
 		block.is_last = self.is_last;
 		block.body.huff.tokens = self.tokens.items;
-		var encoding: deflasm.HuffEncoding = block.body.huff.encoding orelse .{};
-		encoding.final_padding = self.padding;
-		block.body.huff.encoding = encoding;
+		var spelling: deflasm.HuffEncoding = block.body.huff.encoding orelse .{};
+		spelling.final_padding = self.padding;
+		block.body.huff.encoding = spelling;
 		if (self.blocks > 1) {
 			self.joined = true;
 			block = (try optimizeBlockAtOffset(scratch.allocator(), cfg, states, block, self.prior[0..self.prior_len], @intCast(w.totalBits() & 7))).block;
@@ -4773,7 +3510,7 @@ fn boundaryRound(a: std.mem.Allocator, stream: []const u8) deflasm.ParseError!?B
 		if (total != input_bits - found.before + found.after) @panic("boundary search price differs from assembly");
 		for (found.blocks, found.fresh) |*b, f| {
 			if (!f or b.body != .huff) continue;
-			var refit = try makeDynamicBlock(ia, b.body.huff.tokens, b.is_last, false, false);
+			var refit = try encoder().complete(ia, b.body.huff.tokens, b.is_last, .{});
 			if (min_dist_codes > 0) refit = try repairDistFloor(ia, refit, min_dist_codes);
 			const refit_bits = try blockCost(refit);
 			if (refit_bits < try blockCost(b.*)) {
@@ -5014,7 +3751,7 @@ test "native encoding metadata survives valid edits and falls back after incompa
 	// A new tree with no 284 invalidates the old preference even when the
 	// parsed context is deliberately retained; cost and output must agree.
 	changed_tokens[1].match.length = common.MAX_MATCH_LENGTH;
-	var rebuilt = try makeDynamicBlock(a, b.body.huff.tokens, true, false, false);
+	var rebuilt = try encoder().complete(a, b.body.huff.tokens, true, .{});
 	rebuilt.body.huff.encoding = b.body.huff.encoding;
 	try std.testing.expectEqual(@as(u8, 0), rebuilt.body.huff.ll_lengths[284]);
 	var w = common.BitWriter.init(&out, a);

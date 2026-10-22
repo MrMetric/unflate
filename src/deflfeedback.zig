@@ -5,6 +5,7 @@ const ir = @import("deflir.zig");
 const reparse = @import("deflreparse.zig");
 const deferred = @import("deflsearch.zig");
 const deflasm = @import("deflasm.zig");
+const encoding = @import("deflencoding.zig");
 const common = @import("deflcommon.zig");
 const A = std.mem.Allocator;
 const Block = deflasm.Block;
@@ -120,6 +121,7 @@ const Task = struct {
 };
 const Controller = struct {
 	const Key = struct { anchor: usize, context: usize, mask: ir.SymbolMask };
+	builder: encoding.Builder,
 	a: A, graph: *deferred.Graph, session: *Session,
 	contexts: std.ArrayList(Context) = .empty,
 	context_ids: std.StringHashMapUnmanaged(usize) = .empty,
@@ -138,7 +140,7 @@ const Controller = struct {
 		const id = c.contexts.items.len;
 		const copy: Encoding = .{ .bytes = try c.a.dupe(u8, encoded.bytes), .bits = encoded.bits };
 		try c.contexts.append(c.a, .{ .block = block, .encoding = copy,
-			.prices = try reparse.prices(c.a, block.body.huff, .{}, 0, @splat(false)) });
+			.prices = try reparse.prices(c.builder, c.a, block.body.huff, .{}, 0, @splat(false)) });
 		try c.context_ids.put(c.a, copy.bytes, id);
 		c.session.stats.contexts += 1;
 		return id;
@@ -231,10 +233,12 @@ fn produce(c: *Controller, sa: A, ca: A, id: usize, seq: *usize, is_last: bool) 
 	if (!(try c.next(task))) return null;
 	const answer = task.answer.?;
 	const ctx = c.contexts.items[task.context];
-	const candidate = if (task.mask == 0)
-		try reparse.materialize(sa, answer.tokens, if (task.variant == 0) null else ctx.block.body.huff, is_last)
-	else
-		try reparse.materializeBySymbol(sa, answer.tokens, if (task.variant == 0) ctx.block.body.huff else null, is_last);
+	const merge = task.variant == @as(usize, if (task.mask == 0) 1 else 0);
+	const candidate = try c.builder.complete(sa, answer.tokens, is_last, .{
+		.trees = if (merge) .{ .merge = .{ .previous = ctx.block.body.huff,
+			.order = if (task.mask == 0) .occurrence else .symbol } } else .{ .fresh = .standard },
+		.header = if (merge) .crossing else .full,
+	});
 	const request = try encode(sa, candidate);
 	seq.* += 1;
 	return .{ .task = id, .bytes = try ca.dupe(u8, request.bytes), .bits = request.bits, .rank = task.rank, .variant = task.variant, .seq = seq.* };
@@ -253,7 +257,7 @@ fn advance(task: *Task, o: Options) void {
 /// `backend.polishEncoded` is the production projection/check/cache service. Only
 /// completed encodings cross that boundary. The caller owns the incumbent
 /// restart policy and supplies the exploration budget.
-pub fn run(a: A, seed: Block, edges: reparse.Edges, backend: anytype, session: *Session) !Block {
+pub fn run(a: A, seed: Block, edges: reparse.Edges, builder: encoding.Builder, backend: anytype, session: *Session) !Block {
 	const raw = edges.program.raw();
 	const o = session.options;
 	if (o.evaluations == 0) return seed;
@@ -271,7 +275,7 @@ pub fn run(a: A, seed: Block, edges: reparse.Edges, backend: anytype, session: *
 			@field(session.stats, field) += @field(chart_stats, field);
 		}
 	}
-	var c: Controller = .{ .a = ca, .graph = &graph, .session = session };
+	var c: Controller = .{ .builder = builder, .a = ca, .graph = &graph, .session = session };
 	var best = try encode(ca, seed);
 	const seed_id = (try c.context(best)).?;
 	try c.addGoals(seed_id);

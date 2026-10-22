@@ -582,7 +582,7 @@ test "single-model search still considers literals instead of a match" {
 	for (tokens[0..100]) |*t| t.* = .{ .lit = 'a' };
 	for (tokens[100..130]) |*t| t.* = .{ .match = .{ .length = 4, .distance = 1 } };
 	tokens[130] = .{ .match = .{ .length = 3, .distance = 1 } };
-	const block = try deflopt.makeDynamicBlock(a, &tokens, true, false, false);
+	const block = try deflopt.encoder().complete(a, &tokens, true, .{});
 	const h = block.body.huff;
 	try std.testing.expectEqual(@as(u8, 4), h.ll_lengths[common.FIRST_LENGTH_SYMBOL] + h.dist_lengths[0]);
 	try std.testing.expectEqual(@as(u8, 3), 3 * h.ll_lengths['a']);
@@ -615,9 +615,9 @@ test "boundary search moves a misplaced split to the cheaper model and prices it
 	var tc: [10000]Token = undefined;
 	for (&tc) |*t| t.* = .{ .lit = 'c' };
 	const blocks = [_]Block{
-		try deflopt.makeDynamicBlock(a, &ta, false, false, false),
-		try deflopt.makeDynamicBlock(a, &tb, false, false, false),
-		try deflopt.makeDynamicBlock(a, &tc, true, false, false),
+		try deflopt.encoder().complete(a, &ta, false, .{}),
+		try deflopt.encoder().complete(a, &tb, false, .{}),
+		try deflopt.encoder().complete(a, &tc, true, .{}),
 	};
 	var costs: [blocks.len]u32 = undefined;
 	var overheads: [blocks.len]u32 = undefined;

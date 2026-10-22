@@ -1,6 +1,6 @@
 //! Shared bounded LZ77 reparse primitives. The caller owns search/acceptance policy.
 const std = @import("std");
-const opt = @import("deflopt.zig");
+const encoding = @import("deflencoding.zig");
 const deflasm = @import("deflasm.zig");
 const ir = @import("deflir.zig");
 const common = @import("deflcommon.zig");
@@ -8,11 +8,6 @@ const A = std.mem.Allocator;
 const Token = deflasm.Token;
 fn ensure(ok: bool) void {
 	if (!ok) @panic("reparse invariant violated");
-}
-pub fn trim(lens: []const u8, floor: usize) []const u8 {
-	var n = lens.len;
-	while (n > floor and lens[n - 1] == 0) n -= 1;
-	return lens[0..n];
 }
 pub const Edge = ir.Edge;
 pub const Edges = ir.Graph;
@@ -320,100 +315,19 @@ test "history matcher reaches distance 32768 and drops it as the window advances
 	try std.testing.expectEqual(@as(usize, 0), expired.items.len);
 }
 
-pub const Counts = struct {
-	ll: [286]u32 = @splat(0),
-	dist: [30]u32 = @splat(0),
-	ll_order: [286]u16 = undefined,
-	d_order: [30]u16 = undefined,
-	nl: usize = 0,
-	nd: usize = 0,
-	fn add(c: *Counts, sym: usize, distance: bool) void {
-		if (distance) {
-			if (c.dist[sym] == 0) {
-				c.d_order[c.nd] = @intCast(sym);
-				c.nd += 1;
-			}
-			c.dist[sym] += 1;
-		} else {
-			if (c.ll[sym] == 0) {
-				c.ll_order[c.nl] = @intCast(sym);
-				c.nl += 1;
-			}
-			c.ll[sym] += 1;
-		}
-	}
-};
-pub fn counts(ts: []const Token, ll: []const u8) Counts {
-	var c: Counts = .{};
-	c.add(common.EOB, false);
-	for (ts) |t| switch (t) {
-		.lit => |b| c.add(b, false),
-		.match => |m| {
-			const code = if (m.length == common.MAX_MATCH_LENGTH and (ll.len <= 285 or ll[285] == 0)) 284 else common.lenCodeTable[m.length].code;
-			c.add(code, false);
-			c.add(common.distCodeTable[m.distance].code, true);
-		},
-	};
-	return c;
-}
-const KRAFT_FULL: u32 = 1 << 15; // Kraft sum in 2^-15 units
-
-fn kraft(lens: []const u8) u32 {
-	var sum: u32 = 0;
-	for (lens) |l| if (l != 0) {
-		ensure(l <= 15);
-		sum += @as(u32, 1) << @intCast(15 - l);
-	};
-	return sum;
-}
-pub fn mergeTree(prev: []const u8, freq: []const u32, order: []const u16, out: []u8) void {
-	opt.freqToLengths(freq, 15, out);
-	for (order) |sym| if (sym < prev.len and prev[sym] != 0) {
-		out[sym] = prev[sym];
-	};
-	if (order.len == 1) {
-		out[order[0]] = 1;
-		return;
-	}
-	// Stable ties follow Counter insertion order, not symbol order.
-	while (kraft(out) > KRAFT_FULL) {
-		var selected: ?usize = null;
-		for (order) |sym| if (out[sym] < 15) {
-			if (selected == null or freq[sym] < freq[selected.?] or
-				(freq[sym] == freq[selected.?] and out[sym] > out[selected.?])) selected = sym;
-		};
-		ensure(selected != null);
-		out[selected.?] += 1;
-	}
-	while (kraft(out) < KRAFT_FULL) {
-		const deficit = KRAFT_FULL - kraft(out);
-		var selected: ?usize = null;
-		for (order) |sym| if (out[sym] > 1 and (@as(u32, 1) << @intCast(15 - out[sym])) <= deficit) {
-			if (selected == null or freq[sym] > freq[selected.?] or
-				(freq[sym] == freq[selected.?] and out[sym] < out[selected.?])) selected = sym;
-		};
-		ensure(selected != null);
-		out[selected.?] -= 1;
-	}
-	ensure(kraft(out) == KRAFT_FULL);
-}
-/// Matchless distance tree under the production floor (opt.min_dist_codes).
-pub fn emptyCl(a: A, ll: []const u8) !opt.EmptyDistCl {
-	return opt.emptyDistCl(a, ll, .full);
-}
-fn header(scratch: *std.heap.ArenaAllocator, ll: []const u8, d: []const u8) !i64 {
+fn header(builder: encoding.Builder, scratch: *std.heap.ArenaAllocator, ll: []const u8, d: []const u8) !i64 {
 	defer _ = scratch.reset(.retain_capacity);
 	const a = scratch.allocator();
-	const lt = trim(ll, common.EOB + 1);
-	const dt = trim(d, 1);
+	const lt = encoding.trim(ll, common.EOB + 1);
+	const dt = encoding.trim(d, 1);
 	var any = false;
 	for (dt) |l| {
 		any = any or l != 0;
 	}
-	return if (any) (try opt.buildClSearch(a, lt, dt)).header_bits else (try emptyCl(a, lt)).built.header_bits;
+	return if (any) (try builder.header(a, lt, dt, .search)).header_bits else (try builder.empty(a, lt, .full)).built.header_bits;
 }
 pub const Prices = struct { ll: [286]f64, dist: [30]f64 };
-pub fn prices(a: A, h: deflasm.Huff, c: Counts, scale: f64, literal_bytes: [256]bool) !Prices {
+pub fn prices(builder: encoding.Builder, a: A, h: deflasm.Huff, c: encoding.Counts, scale: f64, literal_bytes: [256]bool) !Prices {
 	var ll_buf: [288]u8 = @splat(0);
 	var d_buf: [32]u8 = @splat(0);
 	const ll = ll_buf[0..if (h.is_fixed) @as(usize, 288) else 286];
@@ -435,7 +349,7 @@ pub fn prices(a: A, h: deflasm.Huff, c: Counts, scale: f64, literal_bytes: [256]
 		for (d[0..30], &p.dist) |v, *price| price.* = @floatFromInt(if (v == 0) de else v);
 		return p;
 	}
-	const base = try header(&scratch, ll, d);
+	const base = try header(builder, &scratch, ll, d);
 	for (0..286) |sym| {
 		if (sym == common.EOB or (sym < common.EOB and !literal_bytes[sym] and ll[sym] == 0)) {
 			p.ll[sym] = @floatFromInt(if (ll[sym] == 0) le else ll[sym]);
@@ -443,7 +357,7 @@ pub fn prices(a: A, h: deflasm.Huff, c: Counts, scale: f64, literal_bytes: [256]
 		}
 		const saved = ll[sym];
 		ll[sym] = if (saved == 0) le else 0;
-		const hc = try header(&scratch, ll, d);
+		const hc = try header(builder, &scratch, ll, d);
 		ll[sym] = saved;
 		const delta: f64 = @floatFromInt(if (saved == 0) hc - base else base - hc);
 		p.ll[sym] = @as(f64, @floatFromInt(if (saved == 0) le else saved)) + scale * delta / @as(f64, @floatFromInt(@max(c.ll[sym], 1)));
@@ -451,7 +365,7 @@ pub fn prices(a: A, h: deflasm.Huff, c: Counts, scale: f64, literal_bytes: [256]
 	for (0..30) |sym| {
 		const saved = d[sym];
 		d[sym] = if (saved == 0) de else 0;
-		const hc = try header(&scratch, ll, d);
+		const hc = try header(builder, &scratch, ll, d);
 		d[sym] = saved;
 		const delta: f64 = @floatFromInt(if (saved == 0) hc - base else base - hc);
 		p.dist[sym] = @as(f64, @floatFromInt(if (saved == 0) de else saved)) + scale * delta / @as(f64, @floatFromInt(@max(c.dist[sym], 1)));
@@ -549,45 +463,6 @@ pub fn parse(a: A, edges: Edges, p: Prices) !Parse {
 	std.mem.reverse(Token, ts.items);
 	return .{ .tokens = ts.items, .predicted = predicted };
 }
-pub fn materialize(a: A, ts: []Token, prev: ?deflasm.Huff, is_last: bool) !deflasm.Block {
-	return materializeOrdered(a, ts, prev, is_last, false);
-}
-
-/// Feedback completions merge trees in symbol order. The main reparse walk
-/// uses first-occurrence order instead; both retain their own tie ordering.
-pub fn materializeBySymbol(a: A, ts: []Token, prev: ?deflasm.Huff, is_last: bool) !deflasm.Block {
-	return materializeOrdered(a, ts, prev, is_last, true);
-}
-
-fn materializeOrdered(a: A, ts: []Token, prev: ?deflasm.Huff, is_last: bool, comptime by_symbol: bool) !deflasm.Block {
-	var block = try opt.makeDynamicBlock(a, ts, is_last, false, false);
-	if (prev) |h| {
-		var c = counts(ts, h.ll_lengths);
-		if (by_symbol) {
-			std.mem.sort(u16, c.ll_order[0..c.nl], {}, std.sort.asc(u16));
-			std.mem.sort(u16, c.d_order[0..c.nd], {}, std.sort.asc(u16));
-		}
-		var ll: [286]u8 = undefined;
-		var d: [30]u8 = undefined;
-		mergeTree(h.ll_lengths, &c.ll, c.ll_order[0..c.nl], &ll);
-		var b = &block.body.huff;
-		b.ll_lengths = try a.dupe(u8, trim(&ll, common.EOB + 1));
-		if (c.nd != 0) {
-			mergeTree(h.dist_lengths, &c.dist, c.d_order[0..c.nd], &d);
-			opt.distFloor(&d);
-			b.dist_lengths = try a.dupe(u8, trim(&d, 1));
-			const cl = try opt.buildClCrossing(a, b.ll_lengths, b.dist_lengths);
-			b.cl_entries = cl.entries.items;
-			b.cl_lengths = cl.cl_lengths;
-		} else {
-			const e = try emptyCl(a, b.ll_lengths);
-			b.dist_lengths = try a.dupe(u8, e.dist);
-			b.cl_entries = e.built.entries.items;
-			b.cl_lengths = e.built.cl_lengths;
-		}
-	}
-	return block;
-}
 test "match edges preserve nearest longest sources and overlapping copies" {
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
@@ -631,14 +506,6 @@ test "large matcher keeps nearest 1024 prefix occurrences" {
 			try std.testing.expectEqual(@min(common.MAX_MATCH_LENGTH, raw.len - i), e.length);
 		}
 	}
-}
-test "tree completion uses insertion order to break equal-frequency ties" {
-	const freq = [_]u32{ 1, 1, 1, 1 };
-	const prev = [_]u8{ 3, 3, 3, 3 };
-	var out: [4]u8 = undefined;
-	mergeTree(&prev, &freq, &.{ 2, 0, 3, 1 }, &out);
-	try std.testing.expectEqualDeep([_]u8{ 2, 3, 1, 3 }, out);
-	try std.testing.expectEqual(@as(u32, KRAFT_FULL), kraft(&out));
 }
 
 test "indexed sources keep the prefix cap and 32768-byte window independent" {
