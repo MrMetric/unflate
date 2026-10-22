@@ -32,6 +32,10 @@ pub const HuffEncoding = struct {
 pub const Token = union(enum) {
 	lit: u8,
 	match: Match,
+
+	pub fn decodedLength(self: Token) usize {
+		return switch (self) { .lit => 1, .match => |m| m.length };
+	}
 };
 
 pub const ClKind = enum(u8) { lit, rep16, rep17, rep18, sep };
@@ -56,6 +60,15 @@ pub const Block = struct {
 	is_last: bool,
 	body: BlockBody,
 	alignment_padding: ?BitPadding = null, // stored blocks only
+
+	/// Output length without executing or validating match references.
+	pub fn decodedLength(self: Block) error{Malformed}!usize {
+		if (self.body == .stored) return self.body.stored.len;
+		var size: usize = 0;
+		for (self.body.huff.tokens) |t|
+			size = std.math.add(usize, size, t.decodedLength()) catch return error.Malformed;
+		return size;
+	}
 };
 
 // Comptime-built fixed-table encoders (assemble side; the decode side uses
@@ -146,10 +159,8 @@ fn parseBlockInner(r: *BitReader, alloc: std.mem.Allocator) ParseError!Block {
 		const width: u3 = @intCast((8 - (r.pos() & 7)) & 7);
 		const padding = BitPadding{ .width = width, .value = @intCast(r.read(width)) };
 		if (r.realAvail() < 4) return error.Malformed;
-		var hdr: [4]u8 = undefined;
-		if (!r.readBytes(&hdr)) return error.Malformed;
-		const len: usize = @as(usize, hdr[0]) | (@as(usize, hdr[1]) << 8);
-		const nlen: usize = @as(usize, hdr[2]) | (@as(usize, hdr[3]) << 8);
+		const len = r.read(16);
+		const nlen = r.read(16);
 		if (nlen != len ^ 0xFFFF) return error.Malformed;
 		if (r.realAvail() < len) return error.Malformed;
 		const data = try alloc.alloc(u8, len);

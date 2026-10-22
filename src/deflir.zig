@@ -9,7 +9,7 @@ pub const Span = struct {
 	length: usize,
 
 	pub fn token(start: usize, t: deflasm.Token) Span {
-		return .{ .start = start, .length = switch (t) { .lit => 1, .match => |m| m.length } };
+		return .{ .start = start, .length = t.decodedLength() };
 	}
 
 	pub fn bytes(s: Span, p: Program) []const u8 {
@@ -34,8 +34,7 @@ pub const Program = struct {
 	/// Own one buffer for history and output, allocated in the block arena.
 	pub fn decode(a: std.mem.Allocator, block: deflasm.Block, dictionary: []const u8) !Program {
 		if (block.body == .stored) return init(a, block.body.stored, dictionary);
-		var length: usize = dictionary.len;
-		for (block.body.huff.tokens) |t| length = std.math.add(usize, length, Span.token(0, t).length) catch return error.Malformed;
+		const length = std.math.add(usize, dictionary.len, try block.decodedLength()) catch return error.Malformed;
 		const buffer = try a.alloc(u8, length);
 		errdefer a.free(buffer);
 		@memcpy(buffer[0..dictionary.len], dictionary);

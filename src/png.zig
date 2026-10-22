@@ -371,19 +371,8 @@ fn countAuxChunk(typ: []const u8, cdata: []const u8, stats: ?*Statistics) i64 {
 		}
 	}
 	if (stats != null or international) {
-		// Roll back partial measurements and legality on optional failure.
-		const saved = if (stats) |s| s.* else Statistics{};
-		const saved_class = measure.worst_class;
-		if (pngCompressedOffset(typ, cdata)) |offset| {
-			const bits = zlib.count(cdata[offset..], stats);
-			if (bits >= 0) return bits;
-		}
-		if (stats) |s| {
-			s.* = saved;
-			s.opaque_streams += 1;
-		}
-		measure.worst_class = saved_class;
-		return 0;
+		const data = if (pngCompressedOffset(typ, cdata)) |offset| cdata[offset..] else null;
+		return countOptionalStream(data, stats);
 	}
 	// Historical zTXt/iCCP counters ignore the compression method byte.
 	const nul = std.mem.indexOfScalar(u8, cdata, 0) orelse return 0;
@@ -392,14 +381,11 @@ fn countAuxChunk(typ: []const u8, cdata: []const u8, stats: ?*Statistics) i64 {
 	return if (bits < 0) 0 else bits;
 }
 
-/// An optional fdAT group may fail after updating counters or legality. Keep
-/// only successful measurements; even an empty group is one opaque stream.
-fn countFrame(data: []const u8, malformed: bool, stats: ?*Statistics) i64 {
+/// Roll back partial measurements and legality when an optional stream fails.
+fn countOptionalStream(data: ?[]const u8, stats: ?*Statistics) i64 {
 	const saved = if (stats) |s| s.* else Statistics{};
 	const saved_class = measure.worst_class;
-	// Historical counters ignored short fdAT fragments and used the lenient
-	// zlib counter. Preserve that path when no actual statistics are requested.
-	const bits = if (stats != null and malformed) ERR else zlib.count(data, stats);
+	const bits = if (data) |bytes| zlib.count(bytes, stats) else ERR;
 	if (bits >= 0) return bits;
 	if (stats) |s| {
 		s.* = saved;
@@ -443,7 +429,8 @@ pub fn count(data: []const u8, stats: ?*Statistics) i64 {
 		// Actual groups end at every non-fdAT chunk. Preserve historical
 		// counters' cross-IDAT grouping for malformed chunk orders only.
 		if (frame_present and !is_fdat and (stats != null or !is_idat)) {
-			aux_total += countFrame(frame.items, frame_malformed, stats);
+			// Historical counters ignore short fdAT fragments.
+			aux_total += countOptionalStream(if (stats != null and frame_malformed) null else frame.items, stats);
 			frame.clearRetainingCapacity();
 			frame_present = false;
 			frame_malformed = false;
@@ -463,7 +450,7 @@ pub fn count(data: []const u8, stats: ?*Statistics) i64 {
 		pos += 12 + length;
 	}
 	if (frame_present) { // trailing frame (file ends on fdAT)
-		aux_total += countFrame(frame.items, frame_malformed, stats);
+		aux_total += countOptionalStream(if (stats != null and frame_malformed) null else frame.items, stats);
 	}
 
 	if (idat.items.len < 6) return ERR; // need zlib hdr(2) + adler(4)

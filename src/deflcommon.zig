@@ -73,19 +73,10 @@ pub const BitReader = struct {
 	/// Skip n whole bytes; reader must be byte-aligned. Returns false if this
 	/// would read past end of data (truncated → caller errors).
 	pub fn skipBytes(self: *BitReader, n: usize) bool {
-		// Buffered lookahead can include synthetic bytes past EOF.
+		std.debug.assert(self.cnt & 7 == 0);
+		if (n == 0) return true;
 		if (n > self.realAvail()) return false;
-		var remaining = n;
-		// Drain whole bytes already buffered.
-		while (self.cnt >= 8 and remaining > 0) {
-			self.buf >>= 8;
-			self.cnt -= 8;
-			remaining -= 1;
-		}
-		if (remaining > 0) {
-			if (self.byte + remaining > self.data.len) return false;
-			self.byte += remaining;
-		}
+		self.* = .{ .data = self.data, .byte = self.byte - self.cnt / 8 + n };
 		return true;
 	}
 
@@ -105,18 +96,11 @@ pub const BitReader = struct {
 	/// Read n whole bytes into out[0..n]; reader must be byte-aligned. Returns
 	/// false if this would read past end of real data (truncated).
 	pub fn readBytes(self: *BitReader, out: []u8) bool {
-		if (out.len > self.realAvail()) return false;
-		for (out) |*b| {
-			if (self.cnt >= 8) {
-				b.* = @intCast(self.buf & 0xff);
-				self.buf >>= 8;
-				self.cnt -= 8;
-			} else {
-				if (self.byte >= self.data.len) return false;
-				b.* = self.data[self.byte];
-				self.byte += 1;
-			}
-		}
+		std.debug.assert(self.cnt & 7 == 0);
+		if (out.len == 0) return true;
+		const start = self.byte - self.cnt / 8;
+		if (!self.skipBytes(out.len)) return false;
+		@memcpy(out, self.data[start..self.byte]);
 		return true;
 	}
 
@@ -548,11 +532,15 @@ test "byte reads reject synthetic lookahead bytes" {
 			try std.testing.expectEqual(@as(?u16, 0), h.decode(&r));
 			r.byteAlign();
 			var out: [3]u8 = undefined;
+			const before = r;
 			const ok = r.readBytes(out[0..n]);
 			try std.testing.expectEqual(n <= data_len - 1, ok);
 			if (ok) {
 				try std.testing.expectEqualSlices(u8, data[1 .. 1 + n], out[0..n]);
 				try std.testing.expectEqual((1 + n) * 8, r.pos());
+				if (1 + n < data_len) try std.testing.expectEqual(data[1 + n], r.read(8));
+			} else {
+				try std.testing.expectEqualDeep(before, r);
 			}
 		}
 	}
@@ -566,9 +554,15 @@ test "byte skips reject synthetic lookahead bytes" {
 			var r = BitReader{ .data = data[0..data_len] };
 			try std.testing.expectEqual(@as(?u16, 0), h.decode(&r));
 			r.byteAlign();
+			const before = r;
 			const ok = r.skipBytes(n);
 			try std.testing.expectEqual(n <= data_len - 1, ok);
-			if (ok) try std.testing.expectEqual((1 + n) * 8, r.pos());
+			if (ok) {
+				try std.testing.expectEqual((1 + n) * 8, r.pos());
+				if (1 + n < data_len) try std.testing.expectEqual(data[1 + n], r.read(8));
+			} else {
+				try std.testing.expectEqualDeep(before, r);
+			}
 		}
 	}
 }

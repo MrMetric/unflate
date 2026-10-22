@@ -328,6 +328,7 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: deflate.Options, 
 	if (arc.passthrough) return in;
 	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer scratch.deinit();
+	var changed = false;
 	for (arc.entries) |*e| {
 		if (e.method != ZIP_METHOD_DEFLATE or e.gp_flag & ZIP_FLAG_ENCRYPTED != 0) continue;
 		_ = scratch.reset(.{ .retain_with_limit = 8 << 20 });
@@ -342,8 +343,10 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: deflate.Options, 
 		if (result.checksum != e.crc32 or result.decoded_size != e.uncomp_size) continue;
 		if (allow_growth or out.items.len < e.data.len) {
 			e.new_data = try a.dupe(u8, out.items);
+			changed = true;
 		}
 	}
+	if (!changed) return in;
 	const result = try assembleZipMembers(a, arc);
 	return if (!allow_growth and result.len > in.len) in else result;
 }

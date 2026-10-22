@@ -7,6 +7,7 @@ const deflasm = @import("deflasm.zig");
 const reparse = @import("deflreparse.zig");
 const ir = @import("deflir.zig");
 const feedback = @import("deflfeedback.zig");
+const boundary = @import("deflboundary.zig");
 
 const Block = deflasm.Block;
 const Huff = deflasm.Huff;
@@ -1060,6 +1061,8 @@ pub fn distFloor(dist_full: *[30]u8) void {
 
 /// Scoped per CLI worker thread.
 threadlocal var reparse_enabled: bool = true;
+threadlocal var boundary_search_enabled: bool = false;
+threadlocal var boundary_slack: u32 = (boundary.Options{}).slack;
 pub fn swapReparse(enabled: bool) bool {
 	const previous = reparse_enabled;
 	reparse_enabled = enabled;
@@ -3442,9 +3445,9 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 				cur_dp += res.dp;
 				improved = improved or res.improved;
 				if (res.improved or sweep > 0 or bc_round > 0) {
-					// Sweep-1 skip is exactly lossless (see _polish_lengths'
-					// phase-B comment); later sweeps and post-phase-C
-					// rounds re-walk unconditionally.
+					// The first sweep reuses phase A's swap/triple result if
+					// structure and screening prices are unchanged. Later
+					// sweeps and outer rounds always recheck.
 					const res2 = try polishSectionPass(alloc, sec.seq, sec.freqs, &clc);
 					cur_dp += res2.dp;
 					improved = improved or res2.improved;
@@ -4637,8 +4640,7 @@ const HuffmanRun = struct {
 fn emitBlock(w: *common.BitWriter, block: Block, prior: []const u8) !struct { split: bool, last_header: usize } {
 	var last_header = w.out.items.len * 8 + w.cnt;
 	if (block.body == .huff) {
-		var size: usize = 0;
-		for (block.body.huff.tokens) |tok| size += switch (tok) { .lit => 1, .match => |m| m.length };
+		const size = try block.decodedLength();
 		if (size > 65535 and storedRegionCost(size, @intCast(last_header & 7)) < try blockCost(block)) {
 			var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 			defer arena.deinit();
@@ -4657,6 +4659,161 @@ fn emitBlock(w: *common.BitWriter, block: Block, prior: []const u8) !struct { sp
 	return .{ .split = false, .last_header = last_header };
 }
 
+/// Settle boundaries and tree/token polishing before discovering new matches
+/// in changed blocks. Repeat when reparsing makes further boundary work useful.
+fn optimizeDeflateFusedConsumed(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize) deflasm.ParseError!void {
+	const start = out.items.len;
+	try fusedPasses(a, out, in, consumed_bytes, null);
+	if (!boundary_search_enabled) return;
+	// Strict byte descent bounds the rounds; a cap would leave work for a second call.
+	while (true) {
+		var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+		defer scratch.deinit();
+		var candidate: std.ArrayList(u8) = .empty;
+		defer candidate.deinit(std.heap.page_allocator);
+		if (!try boundaryPolish(&candidate, out.items[start..])) break;
+		var polished: std.ArrayList(u8) = .empty;
+		defer polished.deinit(std.heap.page_allocator);
+		if (reparse_enabled) {
+			const fresh = try changedBlocks(scratch.allocator(), out.items[start..], candidate.items);
+			var consumed: usize = undefined;
+			try fusedPasses(std.heap.page_allocator, &polished, candidate.items, &consumed, fresh);
+			std.debug.assert(consumed == candidate.items.len);
+		} else std.mem.swap(std.ArrayList(u8), &polished, &candidate);
+		if (polished.items.len >= out.items.len - start) break;
+		out.shrinkRetainingCapacity(start);
+		try out.appendSlice(a, polished.items);
+		if (!reparse_enabled) break; // The boundary/polish loop already settled this encoding.
+	}
+}
+
+/// Keep match discovery outside the boundary/polish loop. The first candidate
+/// may save only bits; reparsing still gets a chance to turn that into bytes.
+fn boundaryPolish(out: *std.ArrayList(u8), stream: []const u8) deflasm.ParseError!bool {
+	const previous = swapReparse(false);
+	defer _ = swapReparse(previous);
+	var current = stream;
+	while (true) {
+		var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+		defer scratch.deinit();
+		const candidate = (try boundaryRound(scratch.allocator(), current)) orelse break;
+		var polished: std.ArrayList(u8) = .empty;
+		defer polished.deinit(std.heap.page_allocator);
+		var consumed: usize = undefined;
+		try fusedPasses(std.heap.page_allocator, &polished, candidate.bytes, &consumed, candidate.fresh);
+		std.debug.assert(consumed == candidate.bytes.len);
+		const shrank = polished.items.len < current.len;
+		if (out.items.len != 0 and !shrank) break;
+		std.mem.swap(std.ArrayList(u8), out, &polished);
+		current = out.items;
+		if (!shrank) break;
+	}
+	return out.items.len != 0;
+}
+
+/// Compare decoded spans as well as encodings: a join or split changes indices.
+fn changedBlocks(a: std.mem.Allocator, before: []const u8, after: []const u8) deflasm.ParseError![]const bool {
+	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+	defer scratch.deinit();
+	const sa = scratch.allocator();
+	const original = try deflasm.parseDeflate(sa, before);
+	const blocks = try deflasm.parseDeflate(sa, after);
+	return freshBlocks(a, original, try boundary.startsOf(sa, original), blocks, try boundary.startsOf(sa, blocks));
+}
+
+fn freshBlocks(a: std.mem.Allocator, original: []const Block, old_starts: []const u32, blocks: []const Block, starts: []const u32) ![]const bool {
+	std.debug.assert(old_starts[original.len] == starts[blocks.len]);
+	const fresh = try a.alloc(bool, blocks.len);
+	var k: usize = 0;
+	for (blocks, 0..) |b, i| {
+		while (k < original.len and old_starts[k] < starts[i]) k += 1;
+		fresh[i] = !(k < original.len and old_starts[k] == starts[i] and old_starts[k + 1] == starts[i + 1] and sameBlock(original[k], b));
+	}
+	return fresh;
+}
+
+const BOUNDARY_INNER_LIMIT = 16;
+
+const BoundaryCandidate = struct { bytes: []u8, fresh: []const bool };
+
+/// Batch boundary searches and tree refits. Only the encoding and change mask
+/// survive; decoded bytes and DP storage are released before token polishing.
+fn boundaryRound(a: std.mem.Allocator, stream: []const u8) deflasm.ParseError!?BoundaryCandidate {
+	var iteration_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+	defer iteration_arena.deinit();
+	const ia = iteration_arena.allocator();
+	const original = try deflasm.parseDeflate(ia, stream);
+	if (original.len == 0) return null;
+	const original_dec = try boundary.decode(ia, original);
+	// Candidate matches come from the incumbent for the whole round; later
+	// iterations can only shorten or drop them, so their own tokens stay reachable.
+	const edges = try boundary.edgesOf(ia, original, original_dec);
+	// Unchanged blocks borrow earlier iterations' slices; retain them until assembly.
+	var blocks = original;
+	var dec = original_dec;
+	var iterations: usize = 0;
+	// Batch cheap refits before the more expensive token/tree polishing.
+	while (iterations < BOUNDARY_INNER_LIMIT) : (iterations += 1) {
+		const costs = try ia.alloc(u32, blocks.len);
+		const overheads = try ia.alloc(u32, blocks.len);
+		var input_bits: u64 = 0;
+		for (blocks, 0..) |b, i| {
+			costs[i] = @intCast(try blockCost(b));
+			input_bits += costs[i];
+			overheads[i] = 0;
+			if (b.body == .huff) {
+				var header = b;
+				header.body.huff.tokens = &.{};
+				overheads[i] = @intCast(try blockCost(header));
+			}
+		}
+		const found = (try boundary.search(ia, blocks, costs, overheads, dec, edges, .{ .slack = boundary_slack })) orelse break;
+		var total: u64 = 0;
+		for (found.blocks) |b| total += @intCast(try blockCost(b));
+		if (total != input_bits - found.before + found.after) @panic("boundary search price differs from assembly");
+		for (found.blocks, found.fresh) |*b, f| {
+			if (!f or b.body != .huff) continue;
+			var refit = try makeDynamicBlock(ia, b.body.huff.tokens, b.is_last, false, false);
+			if (min_dist_codes > 0) refit = try repairDistFloor(ia, refit, min_dist_codes);
+			const refit_bits = try blockCost(refit);
+			if (refit_bits < try blockCost(b.*)) {
+				b.* = refit;
+			}
+		}
+		blocks = found.blocks;
+		dec = .{ .raw = original_dec.raw, .starts = try boundary.startsOf(ia, blocks) };
+	}
+	if (iterations == 0) return null;
+	if (dec.starts[blocks.len] != original_dec.raw.len) @panic("boundary search changed program length");
+	for (blocks, dec.starts[0..blocks.len], dec.starts[1..]) |b, start, end| {
+		if (start > end or end > original_dec.raw.len) @panic("boundary search produced an invalid span");
+		const program = ir.Program{ .bytes = original_dec.raw[0..end], .history = start };
+		program.check(b);
+	}
+	// Fresh: differs from the original block at its span, so it needs the per-block search.
+	const fresh = try freshBlocks(a, original, original_dec.starts, blocks, dec.starts);
+	var out: std.ArrayList(u8) = .empty;
+	try deflasm.assembleDeflate(a, &out, blocks);
+	return .{ .bytes = out.items, .fresh = fresh };
+}
+
+fn sameBlock(x: Block, y: Block) bool {
+	if (x.body == .stored or y.body == .stored) return x.body == .stored and y.body == .stored and std.mem.eql(u8, x.body.stored, y.body.stored);
+	const p = x.body.huff;
+	const q = y.body.huff;
+	if (!sameCodebooks(p, q) or !tokensEqual(p.tokens, q.tokens)) return false;
+	return (blockCost(x) catch return false) == (blockCost(y) catch return false);
+}
+
+/// A Huffman block that was a per-block fixed point at one offset stays one at
+/// another unless stored becomes cheaper there: the offset enters the search
+/// only through the stored comparison.
+fn storedWinsAtOffset(block: Block, offset: u3) !bool {
+	if (block.body != .huff) return true;
+	const size = try block.decodedLength();
+	return storedRegionCost(size, offset) < try blockCost(block);
+}
+
 /// Streaming loop with one reader and one writer.
 /// Each block is parsed and optimized in per-block scratch, folded into the
 /// 32 KB window, and either emitted or added to the pending Huffman run. Memory
@@ -4667,9 +4824,9 @@ fn emitBlock(w: *common.BitWriter, block: Block, prior: []const u8) !struct { sp
 /// emitted header. An entirely empty stream retains one optimized final block.
 /// Reports consumed bytes (the final block's last bit rounded up), so callers
 /// can walk concatenated streams without a separate probe parse.
-fn optimizeDeflateFusedConsumed(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize) deflasm.ParseError!void {
+fn fusedPasses(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, fresh: ?[]const bool) deflasm.ParseError!void {
 	const start = out.items.len;
-	var joined = try optimizeDeflatePass(a, out, in, consumed_bytes, true);
+	var joined = try optimizeDeflatePass(a, out, in, consumed_bytes, true, fresh);
 	var previous: std.ArrayList(u8) = .empty;
 	defer previous.deinit(std.heap.page_allocator);
 	// Joining can change later offsets; raw lowering creates new boundaries.
@@ -4682,12 +4839,15 @@ fn optimizeDeflateFusedConsumed(a: std.mem.Allocator, out: *std.ArrayList(u8), i
 		try previous.appendSlice(std.heap.page_allocator, out.items[start..]);
 		out.shrinkRetainingCapacity(start);
 		var consumed: usize = undefined;
-		joined = try optimizeDeflatePass(a, out, previous.items, &consumed, false);
+		joined = try optimizeDeflatePass(a, out, previous.items, &consumed, false, null);
 		if (std.mem.eql(u8, previous.items, out.items[start..])) break;
 	}
 }
 
-fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, first_pass: bool) deflasm.ParseError!bool {
+/// `fresh` (first pass only) marks blocks that need the per-block search;
+/// the others are known fixed points and get it only where stored would win
+/// at their new offset.
+fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, first_pass: bool, fresh: ?[]const bool) deflasm.ParseError!bool {
 	var r = common.BitReader{ .data = in };
 	var w = common.BitWriter.init(out, a);
 	// Keep only the last 32768 decoded bytes as context for the next block.
@@ -4714,7 +4874,8 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 	var last_header: ?usize = null;
 	var run: HuffmanRun = .{};
 	defer run.deinit();
-	while (true) {
+	var index: usize = 0;
+	while (true) : (index += 1) {
 		_ = scratch.reset(SCRATCH_RESET);
 		const source_offset: u3 = @intCast(r.pos() & 7);
 		const b = try deflasm.parseBlock(&r, scratch.allocator());
@@ -4741,7 +4902,8 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 		const offset: u3 = @intCast((w.totalBits() + pending_bits) & 7);
 		// Huffman outputs are already closed under this search unless their
 		// starting offset changed. Stored blocks may be newly lowered chunks.
-		var res: OptResult = if (first_pass or b.body == .stored or offset != source_offset)
+		const search_it = if (fresh) |f| (index >= f.len or f[index] or b.body == .stored or try storedWinsAtOffset(b, offset)) else (first_pass or b.body == .stored or offset != source_offset);
+		var res: OptResult = if (search_it)
 			try optimizeBlockAtOffset(scratch.allocator(), &cfg_scratch, &states, b, window[0..wlen], offset)
 		else .{ .block = b, .raw = (try ir.Program.decode(scratch.allocator(), b, window[0..wlen])).raw() };
 		if (run.blocks != 0 and (res.block.body != .huff or !sameCodebooks(run.header.body.huff, res.block.body.huff))) {
@@ -4892,6 +5054,8 @@ test "native encoding metadata survives valid edits and falls back after incompa
 /// Options are scoped to this call, including nested research calls.
 pub const Options = struct {
 	reparse: bool = true,
+	boundary_search: bool = false,
+	boundary_slack: u32 = (boundary.Options{}).slack,
 	min_dist_codes: u8 = 2,
 	explore_read: ExploreRead = .{},
 	feedback_policy: FeedbackPolicy = .{},
@@ -4901,7 +5065,7 @@ pub const Options = struct {
 
 /// Snapshot the legacy research scope for callers migrating from swap* APIs.
 pub fn currentOptions() Options {
-	return .{ .reparse = reparse_enabled, .min_dist_codes = min_dist_codes,
+	return .{ .reparse = reparse_enabled, .boundary_search = boundary_search_enabled, .boundary_slack = boundary_slack, .min_dist_codes = min_dist_codes,
 		.explore_read = explore_read, .feedback_policy = feedback_policy,
 		.feedback_session = feedback_session, .memo = active_optimizer_memo };
 }
@@ -4909,6 +5073,8 @@ pub fn currentOptions() Options {
 fn setOptions(options: Options) void {
 	std.debug.assert(options.min_dist_codes <= 2);
 	reparse_enabled = options.reparse;
+	boundary_search_enabled = options.boundary_search;
+	boundary_slack = options.boundary_slack;
 	min_dist_codes = options.min_dist_codes;
 	explore_read = options.explore_read;
 	feedback_policy = options.feedback_policy;

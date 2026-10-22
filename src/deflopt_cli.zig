@@ -4,8 +4,8 @@
 //! -r walks directories and selects files by signature. -i/-o selects pair
 //! mode; without files, stdin and stdout carry a binary stream.
 //!
-//! I/O uses Linux syscalls. The work queue and counters use atomics; each
-//! status line uses a single write. Optimizer invariant failures abort.
+//! I/O uses Linux syscalls. The work queue and counters use atomics.
+//! Optimizer invariant failures abort.
 
 const std = @import("std");
 const Args = @import("cli_args.zig").Args;
@@ -40,13 +40,10 @@ fn writeAllFd(fd: i32, bytes: []const u8) !void {
 	}
 }
 
-/// Formatted print to fd 1/2 as ONE write(2) — no lock needed for line
-/// integrity. Output is low-volume status text; truncation at 4 KB is fine.
+/// Format status text into a fixed buffer, truncating at 4 KiB.
 fn fdPrint(fd: i32, comptime fmt: []const u8, args: anytype) void {
 	var buf: [4096]u8 = undefined;
-	const s = std.fmt.bufPrint(&buf, fmt, args) catch blk: {
-		break :blk buf[0..];
-	};
+	const s = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
 	writeAllFd(fd, s) catch {};
 }
 
@@ -451,7 +448,7 @@ fn runPair(alloc: std.mem.Allocator, in_path: []const u8, out_path: []const u8, 
 	} else |_| {}
 	const iz = pathZ(alloc, in_path) catch usageExit("error: out of memory", .{});
 	const ist = statxAt(iz) catch |e| usageExit("error: {s}: {s}", .{ in_path, @errorName(e) });
-	const data = readWholeFile(alloc, iz) catch usageExit("error: cannot read: {s}", .{in_path});
+	const data = readWholeFile(alloc, iz) catch |e| usageExit("error: cannot read {s}: {s}", .{ in_path, @errorName(e) });
 	const kind = selectFormat(data) orelse usageExit("error: {s}: not PNG/gzip/zip", .{in_path});
 	const out = optimizeBytes(alloc, kind, data, in_path) catch |e|
 		usageExit("error: {s}: {s}", .{ in_path, optimizeError(e) });
@@ -460,11 +457,11 @@ fn runPair(alloc: std.mem.Allocator, in_path: []const u8, out_path: []const u8, 
 		return 0;
 	}
 	{
-		const fd = sysOpen(oz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o666) catch
-			usageExit("error: cannot write: {s}", .{out_path});
+		const fd = sysOpen(oz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o666) catch |e|
+			usageExit("error: cannot write {s}: {s}", .{ out_path, @errorName(e) });
 		defer _ = linux.close(fd);
-		writeAllFd(fd, out) catch usageExit("error: write failed: {s}", .{out_path});
-		// copystat: mode + times (the meaningful subset of shutil.copystat here).
+		writeAllFd(fd, out) catch |e| usageExit("error: writing {s}: {s}", .{ out_path, @errorName(e) });
+		// Copy source permissions to regular-file output.
 		if (!stream) _ = linux.fchmod(fd, ist.mode & 0o7777);
 	}
 	const times = [2]linux.timespec{
@@ -523,6 +520,10 @@ const HELP =
 	\\  --discard-unsafe-chunks  omit unknown unsafe PNG chunks when needed (default: off)
 	\\  --report-format   report automatically detected type on stderr
 	\\  --fast            skip LZ77 reparsing; retain tree/token re-encoding
+	\\  --slow            add boundary search (default: off; more time and memory)
+	\\                    combines with --fast for boundary search without reparsing
+	\\  --boundary-search / --no-boundary-search  enable (alias of --slow) / disable
+	\\  --boundary-slack N  bytes a block's codebooks may reach beyond it (default: 16384)
 	\\  --min-dist-codes N  distance codewords every rebuilt tree must carry:
 	\\                    2 (default) complete trees, readable by every decoder
 	\\                    1 single 1-bit code allowed (zlib >= 1.2.2)
@@ -583,6 +584,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
 				std.meta.stringToEnum(Kind, value) orelse usageExit("error: --format expects auto|deflate|gzip|png|zip", .{});
 		} else if (args.flag("--fast")) {
 			options.stream.reparse = false;
+		} else if (args.flag("--slow") or args.flag("--boundary-search")) {
+			options.stream.boundary_search = true;
+		} else if (args.flag("--no-boundary-search")) {
+			options.stream.boundary_search = false;
+		} else if (option(&args, "--boundary-slack", "")) |value| {
+			options.stream.boundary_slack = std.fmt.parseInt(u32, value, 10) catch
+				usageExit("error: --boundary-slack expects a non-negative integer, got {s}", .{value});
 		} else if (option(&args, "--min-dist-codes", "")) |value| {
 			options.stream.min_dist_codes = std.fmt.parseInt(u8, value, 10) catch 255;
 			if (options.stream.min_dist_codes > 2) usageExit("error: --min-dist-codes expects 0, 1 or 2, got {s}", .{value});

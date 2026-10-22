@@ -105,12 +105,8 @@ pub fn countReader(r: *BitReader, stats: ?*Statistics) i64 {
 			// LEN/NLEN must come from real bytes.
 			r.byteAlign();
 			if (r.realAvail() < 4) return ERR;
-			const len_lo = r.read(8);
-			const len_hi = r.read(8);
-			const nlen_lo = r.read(8);
-			const nlen_hi = r.read(8);
-			const slen: usize = @intCast(len_lo | (len_hi << 8));
-			if ((nlen_lo | (nlen_hi << 8)) != slen ^ 0xFFFF) return ERR;
+			const slen = r.read(16);
+			if (r.read(16) != slen ^ 0xFFFF) return ERR;
 			if (!r.skipBytes(slen)) return ERR; // truncated
 			// Normalized stored accounting: real cost is 35..42+8*len,
 			// depending on stream alignment. Statistics retain the actual cost.
