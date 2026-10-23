@@ -6,6 +6,8 @@ const zlib = @import("zlib.zig");
 const byteio = @import("byteio.zig");
 const rdint_be = byteio.rdint_be;
 
+const MAX_CHUNK_DATA: u32 = 0x7fffffff;
+
 const SCRATCH_RESET: std.heap.ArenaAllocator.ResetMode = .{ .retain_with_limit = 8 << 20 };
 
 pub const Options = struct {
@@ -81,7 +83,7 @@ fn optimizeChunkData(a: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, ty
 		else => return data,
 	};
 	const selected = selectStream(zlib_data, opt, options.allow_growth);
-	if (selected.ptr == zlib_data.ptr) return data;
+	if (selected.ptr == zlib_data.ptr or selected.len > MAX_CHUNK_DATA - offset) return data;
 	return std.mem.concat(a, u8, &.{ data[0..offset], selected }) catch return data;
 }
 
@@ -100,53 +102,64 @@ test "unknown PNG auxiliary compression methods remain opaque" {
 	}
 }
 
-/// Optimize auxiliary streams and merge consecutive fdAT groups, adjusting
-/// fcTL/fdAT sequence numbers. Compact chunks in place; recycle scratch per stream.
-fn optimizePostIdatChunks(a: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, chunks: []Chunk, options: Options) ![]Chunk {
-	var kept: usize = 0;
-	var seq_delta: u32 = 0;
+/// Emit auxiliary streams and coalesce each fdAT group into legal-sized chunks.
+/// Sequence adjustments account for both removed and newly split chunks.
+fn writePostIdatChunks(a: std.mem.Allocator, out: *std.ArrayList(u8), scratch: *std.heap.ArenaAllocator, chunks: []const Chunk, options: Options, chunk_limit: u32) !void {
+	var seq_delta: i64 = 0;
 	var i: usize = 0;
 	while (i < chunks.len) {
-		std.debug.assert(kept <= i);
 		const c = chunks[i];
 		if (std.mem.eql(u8, c.typ, "fcTL")) {
 			if (c.data.len < 4) return error.Malformed;
-			const seq = rdint_be(u32, c.data, 0);
-			// Refuse malformed sequences rather than wrapping the subtraction.
-			if (seq < seq_delta) return error.Malformed;
-			const nd = if (seq_delta == 0) c.data else
-				try std.mem.concat(a, u8, &.{ &wrU32be(seq - seq_delta), c.data[4..] });
-			chunks[kept] = .{ .typ = c.typ, .data = nd };
+			const seq = try pngSequence(@as(i64, rdint_be(u32, c.data, 0)) - seq_delta);
+			try writePngChunkParts(a, out, c.typ, &.{ &wrU32be(seq), c.data[4..] });
 			i += 1;
 		} else if (std.mem.eql(u8, c.typ, "fdAT")) {
 			if (c.data.len < 4) return error.Malformed;
-			// Merge consecutive fdAT chunks for this frame.
 			const ss = scratch.allocator();
 			var zlib_data: std.ArrayList(u8) = .empty;
-			const first_seq = rdint_be(u32, c.data, 0);
-			if (first_seq < seq_delta) return error.Malformed; // see fcTL above
-			var group_len: u32 = 0;
+			const first_seq = try pngSequence(@as(i64, rdint_be(u32, c.data, 0)) - seq_delta);
+			const start = i;
 			while (i < chunks.len and std.mem.eql(u8, chunks[i].typ, "fdAT")) : (i += 1) {
 				if (chunks[i].data.len < 4) return error.Malformed;
 				try zlib_data.appendSlice(ss, chunks[i].data[4..]);
-				group_len += 1;
 			}
 			const opt = zlib.optimize(ss, zlib_data.items, options.stream) catch |err| switch (err) {
 				error.VerificationFailed => @panic("BUG: frame DEFLATE verification failed"),
 				else => zlib_data.items,
 			};
 			const selected = selectStream(zlib_data.items, opt, options.allow_growth);
-			const nd = try std.mem.concat(a, u8, &.{ &wrU32be(first_seq - seq_delta), selected });
-			chunks[kept] = .{ .typ = "fdAT", .data = nd };
-			seq_delta += group_len - 1; // merged N→1
+			const emitted = try writePngData(a, out, selected, first_seq, chunk_limit);
+			seq_delta += @as(i64, @intCast(i - start)) - @as(i64, @intCast(emitted));
 			_ = scratch.reset(SCRATCH_RESET);
 		} else {
-			chunks[kept] = .{ .typ = c.typ, .data = optimizeChunkData(a, scratch, c.typ, c.data, options) };
+			try writePngChunk(a, out, c.typ, optimizeChunkData(a, scratch, c.typ, c.data, options));
 			i += 1;
 		}
-		kept += 1;
 	}
-	return chunks[0..kept];
+}
+
+fn pngSequence(value: i64) !u32 {
+	if (value < 0 or value > MAX_CHUNK_DATA) return error.Malformed;
+	return @intCast(value);
+}
+
+/// The limit includes fdAT's sequence prefix. Empty payloads still emit a chunk.
+fn writePngData(a: std.mem.Allocator, out: *std.ArrayList(u8), data: []const u8, first_seq: ?u32, chunk_limit: u32) !usize {
+	std.debug.assert(chunk_limit > 4 and chunk_limit <= MAX_CHUNK_DATA);
+	const capacity = chunk_limit - @as(u32, if (first_seq != null) 4 else 0);
+	var rest = data;
+	var emitted: usize = 0;
+	while (true) {
+		const payload = rest[0..@min(rest.len, capacity)];
+		if (first_seq) |first| {
+			const seq = try pngSequence(@as(i64, first) + @as(i64, @intCast(emitted)));
+			try writePngChunkParts(a, out, "fdAT", &.{ &wrU32be(seq), payload });
+		} else try writePngChunk(a, out, "IDAT", payload);
+		emitted += 1;
+		rest = rest[payload.len..];
+		if (rest.len == 0) return emitted;
+	}
 }
 
 test "post-IDAT APNG chunks require complete sequence fields" {
@@ -154,25 +167,33 @@ test "post-IDAT APNG chunks require complete sequence fields" {
 	defer arena.deinit();
 	var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer scratch.deinit();
+	var out: std.ArrayList(u8) = .empty;
 	const sequence = [_]u8{ 0, 0, 0, 0 };
 	for (0..4) |length| {
 		for ([_][]const u8{ "fcTL", "fdAT" }) |typ| {
 			var chunks = [_]Chunk{.{ .typ = typ, .data = sequence[0..length] }};
-			try std.testing.expectError(error.Malformed, optimizePostIdatChunks(arena.allocator(), &scratch, &chunks, .{}));
+			try std.testing.expectError(error.Malformed, writePostIdatChunks(arena.allocator(), &out, &scratch, &chunks, .{}, MAX_CHUNK_DATA));
 		}
 		var chunks = [_]Chunk{
 			.{ .typ = "fdAT", .data = &sequence },
 			.{ .typ = "fdAT", .data = sequence[0..length] },
 		};
-		try std.testing.expectError(error.Malformed, optimizePostIdatChunks(arena.allocator(), &scratch, &chunks, .{}));
+		try std.testing.expectError(error.Malformed, writePostIdatChunks(arena.allocator(), &out, &scratch, &chunks, .{}, MAX_CHUNK_DATA));
 	}
 }
 
 fn writePngChunk(a: std.mem.Allocator, out: *std.ArrayList(u8), typ: []const u8, data: []const u8) !void {
-	try out.appendSlice(a, &wrU32be(@intCast(data.len)));
+	try writePngChunkParts(a, out, typ, &.{data});
+}
+
+fn writePngChunkParts(a: std.mem.Allocator, out: *std.ArrayList(u8), typ: []const u8, parts: []const []const u8) !void {
+	var len: usize = 0;
+	for (parts) |part| len += part.len;
+	std.debug.assert(typ.len == 4 and len <= MAX_CHUNK_DATA);
+	try out.appendSlice(a, &wrU32be(@intCast(len)));
 	const start = out.items.len;
 	try out.appendSlice(a, typ);
-	try out.appendSlice(a, data);
+	for (parts) |part| try out.appendSlice(a, part);
 	try out.appendSlice(a, &wrU32be(std.hash.crc.Crc32.hash(out.items[start..])));
 }
 
@@ -192,6 +213,11 @@ fn unsafePngChunk(typ: []const u8) bool {
 }
 
 pub fn optimize(a: std.mem.Allocator, in: []const u8, options: Options) ![]const u8 {
+	return optimizeWithChunkLimit(a, in, options, MAX_CHUNK_DATA);
+}
+
+fn optimizeWithChunkLimit(a: std.mem.Allocator, in: []const u8, options: Options, chunk_limit: u32) ![]const u8 {
+	std.debug.assert(chunk_limit > 4 and chunk_limit <= MAX_CHUNK_DATA);
 
 	if (in.len < 8 or !std.mem.eql(u8, in[0..8], &PNG_SIG)) return error.Malformed;
 
@@ -212,7 +238,7 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: Options) ![]const
 	while (pos < in.len) {
 		if (pos + 8 > in.len) return error.Malformed;
 		const len: usize = @intCast(rdint_be(u32, in, pos));
-		if (len > 0x7FFFFFFF) return error.Malformed;
+		if (len > MAX_CHUNK_DATA) return error.Malformed;
 		if (pos + 12 + len > in.len) return error.Malformed;
 		const typ = in[pos + 4 .. pos + 8];
 		const cdata = in[pos + 8 .. pos + 8 + len];
@@ -275,7 +301,7 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: Options) ![]const
 	var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer scratch.deinit();
 	const new_idat = selectStream(idat.items, try zlib.optimize(a, idat.items, options.stream), options.allow_growth);
-	const critical_changed = idat_count != 1 or !std.mem.eql(u8, idat.items, new_idat);
+	const critical_changed = idat_count != 1 or new_idat.len > chunk_limit or !std.mem.eql(u8, idat.items, new_idat);
 	const discard = critical_changed and options.discard_unsafe_chunks;
 	if (critical_changed and unsafe_chunks and !discard) {
 		return error.UnsafePngChunk;
@@ -292,16 +318,12 @@ pub fn optimize(a: std.mem.Allocator, in: []const u8, options: Options) ![]const
 		}
 	}
 
-	// Optimize auxiliary chunks.
-	for (pre.items) |*c| c.data = optimizeChunkData(a, &scratch, c.typ, c.data, options);
-	const new_post = try optimizePostIdatChunks(a, &scratch, post.items, options);
-
 	// Assemble.
 	var buf: std.ArrayList(u8) = .empty;
 	try buf.appendSlice(a, &PNG_SIG);
-	for (pre.items) |c| try writePngChunk(a, &buf, c.typ, c.data);
-	try writePngChunk(a, &buf, "IDAT", new_idat);
-	for (new_post) |c| try writePngChunk(a, &buf, c.typ, c.data);
+	for (pre.items) |c| try writePngChunk(a, &buf, c.typ, optimizeChunkData(a, &scratch, c.typ, c.data, options));
+	_ = try writePngData(a, &buf, new_idat, null, chunk_limit);
+	try writePostIdatChunks(a, &buf, &scratch, post.items, options, chunk_limit);
 	// File-level byte no-regress guard.
 	if (!options.allow_growth and buf.items.len > in.len) return in;
 	return buf.items;
@@ -433,4 +455,122 @@ pub fn count(data: []const u8) !measure.Statistics {
 	if (pos != data.len) return error.Malformed;
 	total.add(try zlib.count(idat.items));
 	return total;
+}
+
+fn checkedChunks(a: std.mem.Allocator, bytes: []const u8) ![]Chunk {
+	var chunks: std.ArrayList(Chunk) = .empty;
+	var pos: usize = 0;
+	while (pos < bytes.len) {
+		try std.testing.expect(bytes.len - pos >= 12);
+		const len = rdint_be(u32, bytes, pos);
+		try std.testing.expect(len <= bytes.len - pos - 12);
+		const end = pos + 8 + len;
+		try std.testing.expectEqual(std.hash.crc.Crc32.hash(bytes[pos + 4 .. end]), rdint_be(u32, bytes, end));
+		try chunks.append(a, .{ .typ = bytes[pos + 4 .. pos + 8], .data = bytes[pos + 8 .. end] });
+		pos = end + 4;
+	}
+	return chunks.items;
+}
+
+test "PNG data chunk boundaries preserve bytes CRCs and sequence numbers" {
+	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const data = "0123456789abcdef";
+	for ([_]?u32{ null, 17 }) |seq| {
+		const capacity: usize = if (seq == null) 8 else 4;
+		for ([_]usize{ 0, capacity - 1, capacity, capacity + 1, capacity * 2 }) |len| {
+			var out: std.ArrayList(u8) = .empty;
+			const typ = if (seq == null) "IDAT" else "fdAT";
+			const n = try writePngData(a, &out, data[0..len], seq, 8);
+			const chunks = try checkedChunks(a, out.items);
+			try std.testing.expectEqual(@max(1, (len + capacity - 1) / capacity), n);
+			try std.testing.expectEqual(n, chunks.len);
+			var joined: std.ArrayList(u8) = .empty;
+			for (chunks, 0..) |c, i| {
+				try std.testing.expectEqualStrings(typ, c.typ);
+				try std.testing.expect(c.data.len <= 8);
+				if (seq) |first| try std.testing.expectEqual(first + i, rdint_be(u32, c.data, 0));
+				try joined.appendSlice(a, c.data[if (seq == null) @as(usize, 0) else 4 ..]);
+			}
+			try std.testing.expectEqualStrings(data[0..len], joined.items);
+		}
+	}
+	var out: std.ArrayList(u8) = .empty;
+	try std.testing.expectEqual(1, try writePngData(a, &out, data[0..4], MAX_CHUNK_DATA, 8));
+	try std.testing.expectError(error.Malformed, writePngData(a, &out, data[0..5], MAX_CHUNK_DATA, 8));
+	try std.testing.expectError(error.Malformed, pngSequence(-1));
+}
+
+test "PNG image data is split at the chunk limit" {
+	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const ihdr = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0 };
+	const stream = [_]u8{ 0x78, 0x01, 0x01, 0x02, 0x00, 0xfd, 0xff, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01 };
+	var control = [_]u8{0} ** 22;
+	control[3] = 1; // width
+	control[7] = 1; // height
+	control[17] = 1; // delay numerator
+	control[19] = 30; // delay denominator
+	var input: std.ArrayList(u8) = .empty;
+	try input.appendSlice(a, &PNG_SIG);
+	try writePngChunk(a, &input, "IHDR", &ihdr);
+	try writePngChunkParts(a, &input, "acTL", &.{ &wrU32be(3), &wrU32be(0) });
+	try writePngChunkParts(a, &input, "fcTL", &.{ &wrU32be(0), &control });
+	for (0..stream.len) |i| try writePngChunk(a, &input, "IDAT", stream[i..][0..1]);
+	var seq: u32 = 1;
+	for (0..2) |_| {
+		try writePngChunkParts(a, &input, "fcTL", &.{ &wrU32be(seq), &control });
+		seq += 1;
+		for (0..stream.len) |i| {
+			try writePngChunkParts(a, &input, "fdAT", &.{ &wrU32be(seq), stream[i..][0..1] });
+			seq += 1;
+		}
+		try writePngChunk(a, &input, "tEXt", "note\x00unchanged");
+	}
+	try writePngChunk(a, &input, "IEND", "");
+	for ([_]bool{ false, true }) |reparse| {
+		const options: Options = .{ .stream = .{ .reparse = reparse } };
+		const compact = try optimize(a, input.items, options);
+		const output = try optimizeWithChunkLimit(a, input.items, options, 8);
+		try std.testing.expect(output.len < input.items.len);
+		try std.testing.expectEqualSlices(u8, output, try optimizeWithChunkLimit(a, output, options, 8));
+		// The compact file cannot afford the extra framing. Default rolls back;
+		// explicit growth permission exercises splitting into more chunks than input.
+		try std.testing.expectEqualSlices(u8, compact, try optimizeWithChunkLimit(a, compact, options, 8));
+		var growing = options;
+		growing.allow_growth = true;
+		const split = try optimizeWithChunkLimit(a, compact, growing, 8);
+		try std.testing.expectEqualSlices(u8, output, split);
+		const expected_stream = try zlib.optimize(a, &stream, options.stream);
+		var streams = [_]std.ArrayList(u8){ .empty, .empty, .empty };
+		var frame: usize = 0;
+		var next_seq: u32 = 0;
+		var idats: usize = 0;
+		var texts: usize = 0;
+		for (try checkedChunks(a, output[PNG_SIG.len..])) |c| {
+			if (std.mem.eql(u8, c.typ, "fcTL")) {
+				if (next_seq != 0) frame += 1;
+				try std.testing.expectEqualSlices(u8, &control, c.data[4..]);
+			}
+			if (std.mem.eql(u8, c.typ, "fcTL") or std.mem.eql(u8, c.typ, "fdAT")) {
+				try std.testing.expectEqual(next_seq, rdint_be(u32, c.data, 0));
+				next_seq += 1;
+			}
+			if (std.mem.eql(u8, c.typ, "IDAT") or std.mem.eql(u8, c.typ, "fdAT")) {
+				try std.testing.expect(c.data.len <= 8);
+				if (frame == 0) idats += 1;
+				try streams[frame].appendSlice(a, c.data[if (frame == 0) @as(usize, 0) else 4 ..]);
+			}
+			if (std.mem.eql(u8, c.typ, "tEXt")) {
+				try std.testing.expectEqualStrings("note\x00unchanged", c.data);
+				texts += 1;
+			}
+		}
+		try std.testing.expect(idats > 1);
+		try std.testing.expectEqual(2, texts);
+		try std.testing.expectEqual(2, frame);
+		for (streams) |joined| try std.testing.expectEqualSlices(u8, expected_stream, joined.items);
+	}
 }
