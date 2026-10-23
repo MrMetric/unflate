@@ -574,7 +574,7 @@ fn bitsOf(a: std.mem.Allocator, block: Block) !u32 {
 }
 
 test "single-model search still considers literals instead of a match" {
-	const deflopt = @import("deflopt.zig");
+	const encoding = @import("deflencoding.zig");
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
@@ -582,7 +582,7 @@ test "single-model search still considers literals instead of a match" {
 	for (tokens[0..100]) |*t| t.* = .{ .lit = 'a' };
 	for (tokens[100..130]) |*t| t.* = .{ .match = .{ .length = 4, .distance = 1 } };
 	tokens[130] = .{ .match = .{ .length = 3, .distance = 1 } };
-	const block = try deflopt.encoder().complete(a, &tokens, true, .{});
+	const block = try (encoding.Builder{}).complete(a, &tokens, true, .{});
 	const h = block.body.huff;
 	try std.testing.expectEqual(@as(u8, 4), h.ll_lengths[common.FIRST_LENGTH_SYMBOL] + h.dist_lengths[0]);
 	try std.testing.expectEqual(@as(u8, 3), 3 * h.ll_lengths['a']);
@@ -601,7 +601,7 @@ test "single-model search still considers literals instead of a match" {
 }
 
 test "boundary search moves a misplaced split to the cheaper model and prices it exactly" {
-	const deflopt = @import("deflopt.zig");
+	const encoding = @import("deflencoding.zig");
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
@@ -615,9 +615,9 @@ test "boundary search moves a misplaced split to the cheaper model and prices it
 	var tc: [10000]Token = undefined;
 	for (&tc) |*t| t.* = .{ .lit = 'c' };
 	const blocks = [_]Block{
-		try deflopt.encoder().complete(a, &ta, false, .{}),
-		try deflopt.encoder().complete(a, &tb, false, .{}),
-		try deflopt.encoder().complete(a, &tc, true, .{}),
+		try (encoding.Builder{}).complete(a, &ta, false, .{}),
+		try (encoding.Builder{}).complete(a, &tb, false, .{}),
+		try (encoding.Builder{}).complete(a, &tc, true, .{}),
 	};
 	var costs: [blocks.len]u32 = undefined;
 	var overheads: [blocks.len]u32 = undefined;

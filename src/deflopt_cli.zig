@@ -107,8 +107,11 @@ fn sniffHead(head: []const u8) bool { return containers.sniff(head) != null; }
 var explore_stats_wanted: bool = false;
 
 fn optimizeBytes(alloc: std.mem.Allocator, kind: Kind, data: []const u8, source: []const u8) ![]const u8 {
-	defer if (explore_stats_wanted) printExploreStats(source);
-	return containers.optimize(alloc, kind, data, options);
+	var stats: deflopt.ExploreStats = .{};
+	var local = options;
+	local.stream.stats = &stats;
+	defer if (explore_stats_wanted) printExploreStats(source, stats);
+	return containers.optimize(alloc, kind, data, local);
 }
 
 fn optimizeError(e: anyerror) []const u8 {
@@ -473,9 +476,7 @@ fn runPair(alloc: std.mem.Allocator, in_path: []const u8, out_path: []const u8, 
 	return 0;
 }
 
-/// Drain this input's counters on the thread that performed its optimization.
-fn printExploreStats(source: []const u8) void {
-	const s = deflopt.takeExploreStats();
+fn printExploreStats(source: []const u8, s: deflopt.ExploreStats) void {
 	fdPrint(2, "explore-stats reads={d}/{d}/{d} hits={d}/{d}/{d} confirms={d} confirm_gains={d} rounds={d} full_ties={d} agree_single={d} disagree_single={d} agree_assemble={d} disagree_assemble={d} input={s}\n", .{
 		s.reads[0], s.reads[1], s.reads[2], s.hits[0], s.hits[1], s.hits[2], s.confirms, s.confirm_gains, s.rounds, s.full_ties,
 		s.agree[1], s.disagree[1], s.agree[2], s.disagree[2], source,

@@ -37,38 +37,37 @@ const SCRATCH_RESET: std.heap.ArenaAllocator.ResetMode = .{ .retain_with_limit =
 const fixed_ll_bits = common.fixed_ll_lengths;
 
 test "distance floor: built trees carry the configured codewords, inherited ones pass through" {
+	var p: Polisher = .{};
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
-	const previous = swapMinDistCodes(2);
-	defer _ = swapMinDistCodes(previous);
 
-	// distFloor: only the single-symbol case changes; the filler takes the
+	// Only the single-symbol case changes; the filler takes the
 	// lowest absent index and the used symbol is forced to one bit.
 	var d = [_]u8{0} ** 30;
 	d[5] = 3;
-	distFloor(&d);
+	encoding.applyFloor(&d, p.floor);
 	try std.testing.expectEqual(@as(u8, 1), d[0]);
 	try std.testing.expectEqual(@as(u8, 1), d[5]);
 	try std.testing.expectEqual(@as(usize, 2), countNonzero(&d));
 	d = [_]u8{0} ** 30;
 	d[0] = 1;
-	distFloor(&d);
+	encoding.applyFloor(&d, p.floor);
 	try std.testing.expectEqual(@as(u8, 1), d[1]);
 	d = [_]u8{0} ** 30;
 	d[3] = 1;
 	d[7] = 1;
-	distFloor(&d);
+	encoding.applyFloor(&d, p.floor);
 	try std.testing.expectEqual(@as(usize, 2), countNonzero(&d));
 	try std.testing.expectEqual(@as(u8, 0), d[0]);
 	d = [_]u8{0} ** 30;
-	distFloor(&d);
+	encoding.applyFloor(&d, p.floor);
 	try std.testing.expectEqual(@as(usize, 0), countNonzero(&d));
 	for ([_]u8{ 0, 1 }) |level| {
-		_ = swapMinDistCodes(level);
+		p.floor = level;
 		d = [_]u8{0} ** 30;
 		d[5] = 1;
-		distFloor(&d);
+		encoding.applyFloor(&d, p.floor);
 		try std.testing.expectEqual(@as(usize, 1), countNonzero(&d));
 	}
 
@@ -82,22 +81,22 @@ test "distance floor: built trees carry the configured codewords, inherited ones
 	// invisible to the structural screen).
 	for (single[48..]) |*t| t.* = .{ .match = .{ .length = 3, .distance = 5 } };
 	for ([_]u8{ 0, 1, 2 }) |level| {
-		_ = swapMinDistCodes(level);
-		const cands = encoding.emptyDistCandidates(min_dist_codes);
+		p.floor = level;
+		const cands = encoding.emptyDistCandidates(p.floor);
 		try std.testing.expectEqual(@as(usize, if (level == 0) 2 else 1), cands.len);
 		for (cands) |c| try std.testing.expect(countNonzero(c) >= level);
-		const m = (try encoder().complete(a, &lits, true, .{})).body.huff;
+		const m = (try p.encoder().complete(a, &lits, true, .{})).body.huff;
 		try std.testing.expect(countNonzero(m.dist_lengths) >= level);
 		try std.testing.expectEqual(@as(usize, if (level == 2) 2 else 1), m.dist_lengths.len);
-		const s = (try encoder().complete(a, &single, true, .{})).body.huff;
+		const s = (try p.encoder().complete(a, &single, true, .{})).body.huff;
 		try std.testing.expectEqual(@as(usize, if (level == 2) 2 else 1), countNonzero(s.dist_lengths));
 		try std.testing.expectEqual(@as(u8, 1), s.dist_lengths[4]);
 		try std.testing.expectEqual(@as(u8, if (level == 2) 1 else 0), s.dist_lengths[0]);
 		// The floor is a property of what we build, never of what we read.
 		try std.testing.expect(satisfiesDistFloor(.{ .is_last = true, .body = .{ .huff = s } }, .{ .is_last = true, .body = .{ .stored = "x" } }, level));
 	}
-	_ = swapMinDistCodes(2);
-	const hazard = (try encoder().complete(a, &single, true, .{})).body.huff;
+	p.floor = 2;
+	const hazard = (try p.encoder().complete(a, &single, true, .{})).body.huff;
 	var lone = [_]u8{1};
 	var inherited = hazard;
 	inherited.dist_lengths = &lone;
@@ -109,10 +108,10 @@ test "distance floor: built trees carry the configured codewords, inherited ones
 
 	// The filler is a dead code. Under the floor the revoke is gated
 	// and the polish keeps two codewords; without it the revoke pays.
-	const floored = try polishLengths(a, hazard);
+	const floored = try polishLengths(p, a, hazard);
 	if (floored) |r| try std.testing.expect(countNonzero(r.dist) >= 2);
-	_ = swapMinDistCodes(0);
-	const revoked = (try polishLengths(a, hazard)).?;
+	p.floor = 0;
+	const revoked = (try polishLengths(p, a, hazard)).?;
 	try std.testing.expectEqual(@as(usize, 1), countNonzero(revoked.dist));
 
 	// Trailing zero lengths (HDIST padding) do not change the code, so a
@@ -158,15 +157,10 @@ test "distance floor: a re-padded inherited empty tree is the floor-free answer"
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
-	const previous_floor = swapMinDistCodes(2);
-	defer _ = swapMinDistCodes(previous_floor);
+
 	for ([_]bool{ false, true }) |reparse_on| {
-		const previous_reparse = swapReparse(reparse_on);
-		defer _ = swapReparse(previous_reparse);
-		_ = swapMinDistCodes(0);
-		const free = try optimizeDeflateBytes(a, &input);
-		_ = swapMinDistCodes(2);
-		const floored = try optimizeDeflateBytes(a, &input);
+		const free = try optimizeDeflateBytes(.{ .reparse = reparse_on, .min_dist_codes = 0 }, a, &input);
+		const floored = try optimizeDeflateBytes(.{ .reparse = reparse_on, .min_dist_codes = 2 }, a, &input);
 		try std.testing.expect(inflateEql(&input, floored));
 		try std.testing.expectEqualSlices(u8, free, floored);
 	}
@@ -186,8 +180,8 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 	const a = arena.allocator();
 	var memo = try OptimizerMemo.init(std.testing.allocator, 1);
 	defer memo.deinit();
-	const previous = swapOptimizerMemo(null);
-	defer _ = swapOptimizerMemo(previous);
+
+	var p: Polisher = .{};
 	var tokens = [_]Token{.{ .lit = 65 }} ** 64;
 	tokens[0] = .{ .lit = 66 };
 	// Deliberately give the rare literal the shortest code.
@@ -198,16 +192,16 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 	var seed_dist = [_]u8{1};
 	var saw_result = false;
 	for ([_]bool{ false, true }) |t24| {
-		cl_t24_arbitration = t24;
-		defer cl_t24_arbitration = false;
+		p.extra_seeds = t24;
+
 		for (1..4) |n| {
 			var h = fixedHuffBlock(tokens[0 .. n * 20], true).body.huff;
 			h.ll_lengths = &seed_ll;
 			h.dist_lengths = &seed_dist;
-			const expected = try polishLengths(a, h);
-			_ = swapOptimizerMemo(&memo);
+			const expected = try polishLengths(p, a, h);
+			p.memo = &memo;
 			const misses = memo.polish_misses;
-			const first = try polishLengths(a, h);
+			const first = try polishLengths(p, a, h);
 			try std.testing.expectEqual(misses + 1, memo.polish_misses);
 			try std.testing.expectEqualDeep(expected, first);
 			if (first) |r| {
@@ -215,17 +209,18 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 				r.ll[0] +%= 1;
 			}
 			const hits = memo.polish_hits;
-			try std.testing.expectEqualDeep(expected, try polishLengths(a, h));
+			try std.testing.expectEqualDeep(expected, try polishLengths(p, a, h));
 			try std.testing.expectEqual(hits + 1, memo.polish_hits);
 			// Reordering literals preserves the memoized subproblem.
 			std.mem.swap(Token, &tokens[0], &tokens[1]);
-			try std.testing.expectEqualDeep(expected, try polishLengths(a, h));
+			try std.testing.expectEqualDeep(expected, try polishLengths(p, a, h));
 			try std.testing.expectEqual(hits + 2, memo.polish_hits);
 			std.mem.swap(Token, &tokens[0], &tokens[1]);
-			_ = swapOptimizerMemo(null);
+			p.memo = null;
 		}
 	}
 	try std.testing.expect(saw_result);
+	p.extra_seeds = false;
 	// A minimal two-symbol tree has no profitable polish. Null is reusable.
 	var ll = [_]u8{0} ** (common.EOB + 1);
 	ll[65] = 1;
@@ -234,61 +229,19 @@ test "optimizer memo: tree polish counts, nulls, ownership and mode" {
 	var h = fixedHuffBlock(tokens[1..2], true).body.huff;
 	h.ll_lengths = &ll;
 	h.dist_lengths = &dist;
-	_ = swapOptimizerMemo(&memo);
-	try std.testing.expectEqual(@as(?PolishResult, null), try polishLengths(a, h));
+	p.memo = &memo;
+	try std.testing.expectEqual(@as(?PolishResult, null), try polishLengths(p, a, h));
 	const hits = memo.polish_hits;
-	try std.testing.expectEqual(@as(?PolishResult, null), try polishLengths(a, h));
+	try std.testing.expectEqual(@as(?PolishResult, null), try polishLengths(p, a, h));
 	try std.testing.expectEqual(hits + 1, memo.polish_hits);
 	const misses = memo.polish_misses;
-	cl_t24_arbitration = true;
-	defer cl_t24_arbitration = false;
-	_ = try polishLengths(a, h);
+	p.extra_seeds = true;
+
+	_ = try polishLengths(p, a, h);
 	try std.testing.expectEqual(misses + 1, memo.polish_misses);
 }
 
-
 const ClModel = encoding.Header;
-
-/// Enable the all-literal and rep16-only CL seeds during the second
-/// portfolio pass. The crossing chain always includes them. Thread-local
-/// state prevents one worker from changing another worker's arbitration.
-threadlocal var cl_t24_arbitration: bool = false;
-
-/// Minimum number of codewords in rebuilt distance trees. Inherited trees
-/// remain eligible unchanged. Level 0 permits empty and single-code trees;
-/// level 1 requires a codeword; level 2 builds complete trees by adding a
-/// one-bit filler at the lowest unused symbol when necessary.
-/// The floor also applies to search costs: applying it only at emission
-/// changes which candidates win. Each CLI worker owns its thread-local setting.
-threadlocal var min_dist_codes: u8 = 2;
-pub fn swapMinDistCodes(next: u8) u8 {
-	std.debug.assert(next <= 2);
-	const previous = min_dist_codes;
-	min_dist_codes = next;
-	return previous;
-}
-pub fn minDistCodes() u8 {
-	return min_dist_codes;
-}
-
-/// Apply the floor to a freshly built 30-entry distance tree. freqToLengths
-/// and mergeTree give a single used symbol a 1-bit code and >= 2 symbols a
-/// complete tree, so only the single-symbol case needs the filler. The
-/// filler's position is a materialization choice; the filler relocation move may
-/// then park the dead code wherever the CL header prices it cheapest.
-fn distFloor(dist_full: *[30]u8) void {
-	encoding.applyFloor(dist_full, min_dist_codes);
-}
-
-/// Scoped per CLI worker thread.
-threadlocal var reparse_enabled: bool = true;
-threadlocal var boundary_search_enabled: bool = false;
-threadlocal var boundary_slack: u32 = (boundary.Options{}).slack;
-pub fn swapReparse(enabled: bool) bool {
-	const previous = reparse_enabled;
-	reparse_enabled = enabled;
-	return previous;
-}
 
 /// Optional research override. Null selects the bounded production policy;
 /// a session with zero evaluations selects the pre-extension reparse search.
@@ -324,40 +277,13 @@ pub const ExploreStats = struct {
 	agree: [3]usize = .{ 0, 0, 0 },
 	disagree: [3]usize = .{ 0, 0, 0 },
 };
-threadlocal var explore_read: ExploreRead = .{};
-threadlocal var explore_stats: ExploreStats = .{};
-pub fn swapExploreRead(next: ExploreRead) ExploreRead {
-	const previous = explore_read;
-	explore_read = next;
-	return previous;
-}
-pub fn takeExploreStats() ExploreStats {
-	const s = explore_stats;
-	explore_stats = .{};
-	return s;
-}
-
 pub const FeedbackOrder = feedback.Order;
 /// Completion ordering and admission policy; defaults bound the production search.
 pub const FeedbackPolicy = struct { order: FeedbackOrder = .creation, cheap_contexts: bool = false };
-threadlocal var feedback_policy: FeedbackPolicy = .{};
-pub fn swapFeedbackPolicy(next: FeedbackPolicy) FeedbackPolicy {
-	const previous = feedback_policy;
-	feedback_policy = next;
-	return previous;
-}
-threadlocal var feedback_session: ?*FeedbackSession = null;
-pub fn swapFeedbackSearch(session: ?*FeedbackSession) ?*FeedbackSession {
-	const old = feedback_session;
-	feedback_session = session;
-	return old;
-}
-
 /// Exact tree, sweep, token-portfolio and encoded-read memos for related streams.
 /// Direct-mapped slots bound storage and compare the full key after hashing;
 /// collisions affect speed only. Results are copied to the caller's allocator.
-/// Enabled within production reparsing. The owner must restore the
-/// thread-local scope before freeing the memo (including on errors).
+/// A caller-owned memo may be reused across calls, but not concurrently.
 pub const OptimizerMemo = struct {
 	const SweepKind = enum(u8) { section, structural };
 	const SweepSlot = struct {
@@ -441,7 +367,6 @@ pub const OptimizerMemo = struct {
 	}
 
 	pub fn deinit(self: *OptimizerMemo) void {
-		std.debug.assert(active_optimizer_memo != self);
 		self.encoding.deinit();
 		self.allocator.free(self.polish_slots);
 		for (self.stream_slots) |*entry| entry.arena.deinit();
@@ -468,9 +393,9 @@ pub const OptimizerMemo = struct {
 		return &self.sweep_slots[hash.final() % self.sweep_slots.len];
 	}
 
-	fn polishSlot(self: *OptimizerMemo, ll: []const u8, dist: []const u8, llf: []const u32, df: []const u32) *PolishSlot {
+	fn polishSlot(self: *OptimizerMemo, builder: encoding.Builder, ll: []const u8, dist: []const u8, llf: []const u32, df: []const u32) *PolishSlot {
 		var hash = std.hash.Wyhash.init(0);
-		hash.update(&.{ @intCast(ll.len & 255), @intCast(ll.len >> 8), @intCast(dist.len), @intFromBool(cl_t24_arbitration), min_dist_codes });
+		hash.update(&.{ @intCast(ll.len & 255), @intCast(ll.len >> 8), @intCast(dist.len), @intFromBool(builder.extra_seeds), builder.floor });
 		hash.update(ll);
 		hash.update(dist);
 		hash.update(std.mem.sliceAsBytes(llf));
@@ -479,40 +404,26 @@ pub const OptimizerMemo = struct {
 	}
 };
 
-threadlocal var active_optimizer_memo: ?*OptimizerMemo = null;
+/// Inputs to token/tree polishing, independent of reparse and boundary policy.
+const Polisher = struct {
+	floor: u8 = 2,
+	extra_seeds: bool = false,
+	memo: ?*OptimizerMemo = null,
+	offset: u3 = 0,
 
-/// Return the previous scope so nested callers can restore it with defer.
-pub fn swapOptimizerMemo(next: ?*OptimizerMemo) ?*OptimizerMemo {
-	const previous = active_optimizer_memo;
-	active_optimizer_memo = next;
-	return previous;
-}
-
-pub fn encoder() encoding.Builder {
-	return .{ .floor = min_dist_codes, .extra_seeds = cl_t24_arbitration,
-		.memo = if (active_optimizer_memo) |m| &m.encoding else null };
-}
-
-fn buildCl(a: std.mem.Allocator, ll: []const u8, dist: []const u8) !encoding.BuiltCl {
-	return encoder().header(a, ll, dist, .full);
-}
-fn buildClCrossing(a: std.mem.Allocator, ll: []const u8, dist: []const u8) !encoding.BuiltCl {
-	return encoder().header(a, ll, dist, .crossing);
-}
-fn emptyDistCl(a: std.mem.Allocator, ll: []const u8, mode: encoding.Header) !encoding.DistanceHeader {
-	return encoder().empty(a, ll, mode);
-}
-fn dynCostFromFreqs(a: std.mem.Allocator, ll: []const u32, dist: []const u32, extra: i64, mode: encoding.Header) !i64 {
-	return encoder().costFromFreqs(a, ll, dist, extra, mode);
-}
+	fn encoder(p: Polisher) encoding.Builder {
+		return .{ .floor = p.floor, .extra_seeds = p.extra_seeds,
+			.memo = if (p.memo) |m| &m.encoding else null };
+	}
+};
 
 const ClCost = struct { header_bits: i64, cl_lengths: [19]u8 };
 
 /// Run the full CL builder in resettable scratch and retain only costs
 /// and CL lengths. Callers that do not emit entries need no retained allocation.
-fn buildClCost(scratch: *std.heap.ArenaAllocator, ll_lengths: []const u8, dist_lengths: []const u8) !ClCost {
+fn buildClCost(p: Polisher, scratch: *std.heap.ArenaAllocator, ll_lengths: []const u8, dist_lengths: []const u8) !ClCost {
 	defer _ = scratch.reset(SCRATCH_RESET);
-	const built = try buildCl(scratch.allocator(), ll_lengths, dist_lengths);
+	const built = try p.encoder().header(scratch.allocator(), ll_lengths, dist_lengths, .full);
 	return .{ .header_bits = built.header_bits, .cl_lengths = built.cl_lengths };
 }
 
@@ -542,22 +453,17 @@ fn fixAllLitsCost(raw_freq: []const u32) i64 {
 	return bits;
 }
 
-// Encoding context belongs to costing, not to the decoded byte program.
-// Scopes restore this even when a block search fails; standalone callers start
-// at offset zero. Pure Huffman portfolios do not depend on this value.
-threadlocal var block_offset: u3 = 0;
-
 fn storedRegionCost(size: usize, offset: u3) i64 {
 	const padding: usize = (8 - ((@as(usize, offset) + 3) & 7)) & 7;
 	const extra_chunks = if (size == 0) 0 else (size - 1) / 65535;
 	return @intCast(35 + padding + 8 * size + 40 * extra_chunks);
 }
 
-fn storedCost(raw: []const u8) i64 {
+fn storedCost(offset: u3, raw: []const u8) i64 {
 	// The block search retains physical blocks. Large raw regions are lowered
 	// by the stream emitter, then their new boundaries get ordinary search.
 	if (raw.len > 65535) return std.math.maxInt(i64);
-	return storedRegionCost(raw.len, block_offset);
+	return storedRegionCost(raw.len, offset);
 }
 
 // ── match precompute ───────────────────────
@@ -726,14 +632,14 @@ fn expandMatch(ll_freq: []u32, dist_freq: []u32, kept_extra: *i64, mi: MatchInfo
 
 // Prices are frozen for a whole round, even as its frequency counts change.
 const ExpansionPrices = struct { ll: [286]u8, dist: [30]u8 };
-fn expansionPrices(ll_freq: *const [286]u32, dist_freq: *const [30]u32) ExpansionPrices {
+fn expansionPrices(floor: u8, ll_freq: *const [286]u32, dist_freq: *const [30]u32) ExpansionPrices {
 	var prices: ExpansionPrices = .{ .ll = undefined, .dist = @splat(0) };
 	freqToLengths(ll_freq, 15, &prices.ll);
 	var any_dist = false;
 	for (dist_freq) |f| if (f > 0) { any_dist = true; };
 	if (any_dist) {
 		freqToLengths(dist_freq, 15, &prices.dist);
-		distFloor(&prices.dist);
+		encoding.applyFloor(&prices.dist, floor);
 	}
 	// These are generated trees; encoding supplied trees still validates them.
 	std.debug.assert(common.HuffEnc(288).build(&prices.ll) != null);
@@ -746,6 +652,7 @@ fn expansionPrices(ll_freq: *const [286]u32, dist_freq: *const [30]u32) Expansio
 const NearTie = struct { idx: usize, delta: i64 };
 
 fn optDynamic(
+	p: Polisher,
 	alloc: std.mem.Allocator,
 	orig_tokens: []const Token,
 	matches: []const MatchInfo,
@@ -778,7 +685,7 @@ fn optDynamic(
 	if (drop_258) ll_freq[285] = 0; // never let 285 enter the table
 
 	while (true) {
-		const prices = expansionPrices(&ll_freq, &dist_freq);
+		const prices = expansionPrices(p.floor, &ll_freq, &dist_freq);
 		var greedy = false;
 		var near_ties: std.ArrayList(NearTie) = .empty;
 
@@ -828,7 +735,7 @@ fn optDynamic(
 		// Use greedy CL costs during search. Their overestimates can drive the
 		// expansion loop past states where the exact-cost search stops. The
 		// selected encoding is always costed exactly before acceptance.
-		const baseline = try dynCostFromFreqs(cost_scratch.allocator(), &ll_freq, &dist_freq, kept_extra, cl_model);
+		const baseline = try p.encoder().costFromFreqs(cost_scratch.allocator(), &ll_freq, &dist_freq, kept_extra, cl_model);
 		_ = cost_scratch.reset(SCRATCH_RESET);
 		var best_cost = baseline;
 		var best_mask: usize = 0;
@@ -843,7 +750,7 @@ fn optDynamic(
 					expandMatch(&ll_f, &dist_f, &extra, matches[near_ties.items[j].idx], drop_258);
 				}
 			}
-			const cost = try dynCostFromFreqs(cost_scratch.allocator(), &ll_f, &dist_f, extra, cl_model);
+			const cost = try p.encoder().costFromFreqs(cost_scratch.allocator(), &ll_f, &dist_f, extra, cl_model);
 			_ = cost_scratch.reset(SCRATCH_RESET);
 			if (cost < best_cost) {
 				best_cost = cost;
@@ -877,6 +784,7 @@ const BIDIR_MAX_ROUNDS = 100;
 // to stop oscillation. One more candidate stream
 // for optimizeBlock's exact compare.
 fn optDynamicBidir(
+	p: Polisher,
 	alloc: std.mem.Allocator,
 	orig_tokens: []const Token,
 	matches: []const MatchInfo,
@@ -894,7 +802,7 @@ fn optDynamicBidir(
 
 	var round: usize = 0;
 	while (round < BIDIR_MAX_ROUNDS) : (round += 1) {
-		const prices = expansionPrices(&ll_freq, &dist_freq);
+		const prices = expansionPrices(p.floor, &ll_freq, &dist_freq);
 		var changed = false;
 		for (matches, 0..) |mi, idx| {
 			const ll_b: i64 = prices.ll[mi.lc];
@@ -1414,8 +1322,7 @@ const PolishPassResult = struct { dp: i64, improved: bool };
 test "sweep memo preserves moves, complete keys, collisions and ownership" {
 	var memo = try OptimizerMemo.init(std.testing.allocator, 1);
 	defer memo.deinit();
-	const previous = swapOptimizerMemo(&memo);
-	defer _ = swapOptimizerMemo(previous);
+
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	var prng = std.Random.DefaultPrng.init(0x737765657073);
@@ -1434,7 +1341,7 @@ test "sweep memo preserves moves, complete keys, collisions and ownership" {
 		// Uncoded symbols have no emissions, as in a materialized candidate.
 		for (input[0..n], freqs[0..n]) |len, *f| if (len == 0) { f.* = 0; };
 		var prices: [19]i64 = undefined;
-		for (&prices) |*p| p.* = random.intRangeAtMost(i64, 1, 8);
+		for (&prices) |*price| price.* = random.intRangeAtMost(i64, 1, 8);
 		for ([_]bool{ false, true }) |structural| {
 			const cap = if (trial % 2 == 0) n else n / 2;
 			var expected = input;
@@ -1446,9 +1353,9 @@ test "sweep memo preserves moves, complete keys, collisions and ownership" {
 			var actual = input;
 			const misses = memo.sweep_misses;
 			const measured = if (structural)
-				polishStructuralPass(actual[0..n], freqs[0..n], &prices, cap, 0)
+				polishStructuralPass(&memo, actual[0..n], freqs[0..n], &prices, cap, 0)
 			else
-				try polishSectionPass(a, actual[0..n], freqs[0..n], &prices);
+				try polishSectionPass(&memo, a, actual[0..n], freqs[0..n], &prices);
 			try std.testing.expectEqual(misses + 1, memo.sweep_misses);
 			try std.testing.expectEqualDeep(result, measured);
 			try std.testing.expectEqualSlices(u8, expected[0..n], actual[0..n]);
@@ -1458,9 +1365,9 @@ test "sweep memo preserves moves, complete keys, collisions and ownership" {
 			actual = input;
 			const hits = memo.sweep_hits;
 			const cached = if (structural)
-				polishStructuralPass(actual[0..n], freqs[0..n], &prices, cap, 0)
+				polishStructuralPass(&memo, actual[0..n], freqs[0..n], &prices, cap, 0)
 			else
-				try polishSectionPass(a, actual[0..n], freqs[0..n], &prices);
+				try polishSectionPass(&memo, a, actual[0..n], freqs[0..n], &prices);
 			try std.testing.expectEqual(hits + 1, memo.sweep_hits);
 			try std.testing.expectEqualDeep(result, cached);
 			try std.testing.expectEqualSlices(u8, expected[0..n], actual[0..n]);
@@ -1541,8 +1448,8 @@ const PolishPass = struct {
 
 /// One first-improvement pass over one code-length section: all pairwise
 /// swaps in ascending (i, j) order, then same-depth triples.
-fn polishSectionPass(alloc: std.mem.Allocator, seq: []u8, freqs: []const u32, clc: *const [19]i64) !PolishPassResult {
-	if (active_optimizer_memo) |memo| {
+fn polishSectionPass(cache: ?*OptimizerMemo, alloc: std.mem.Allocator, seq: []u8, freqs: []const u32, clc: *const [19]i64) !PolishPassResult {
+	if (cache) |memo| {
 		if (seq.len <= 288) {
 			const slot = memo.sweepSlot(.section, seq, freqs, clc, 0, 0);
 			if (slot.replay(.section, seq, freqs, clc, 0, 0)) |result| {
@@ -1748,8 +1655,8 @@ const StructPass = struct {
 /// Structural tree moves: revoke, relocate, revoke+promote, grant+demote.
 /// Each move preserves an allowed code set. Each move class starts from
 /// a snapshot of position views; accepted moves recompute those views.
-fn polishStructuralPass(seq: []u8, freqs: []const u32, clc: *const [19]i64, grant_cap: usize, min_codes: usize) PolishPassResult {
-	if (active_optimizer_memo) |memo| {
+fn polishStructuralPass(cache: ?*OptimizerMemo, seq: []u8, freqs: []const u32, clc: *const [19]i64, grant_cap: usize, min_codes: usize) PolishPassResult {
+	if (cache) |memo| {
 		if (seq.len <= 288) {
 			const slot = memo.sweepSlot(.structural, seq, freqs, clc, grant_cap, min_codes);
 			if (slot.replay(.structural, seq, freqs, clc, grant_cap, min_codes)) |result| {
@@ -2006,10 +1913,10 @@ const ExactFound = struct { is_ll: bool, sv: []u8, dp: i64, total: i64 };
 
 /// Compare same-depth triples by exact cost: literal/length then distance,
 /// ascending depth, forward before inverse, x1 before x2. Accept strict gains.
-fn polishExactPass(alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAllocator, ll: []u8, dist: []u8, llf: []const u32, df: []const u32, cur_dp: i64) !?ExactFound {
+fn polishExactPass(p: Polisher, alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAllocator, ll: []u8, dist: []u8, llf: []const u32, df: []const u32, cur_dp: i64) !?ExactFound {
 	const tl = trim(ll, common.EOB + 1);
 	const td = trim(dist, 1);
-	var built = try buildClCost(cost_scratch, tl, td);
+	var built = try buildClCost(p, cost_scratch, tl, td);
 	const base_total = built.header_bits + cur_dp;
 	var best: ?ExactFound = null;
 	const sections = [2]struct { is_ll: bool, seq: []u8, freqs: []const u32 }{
@@ -2040,9 +1947,9 @@ fn polishExactPass(alloc: std.mem.Allocator, cost_scratch: *std.heap.ArenaAlloca
 					}
 					const ta = trim(sv, if (sec.is_ll) common.EOB + 1 else 1);
 					built = if (sec.is_ll)
-						try buildClCost(cost_scratch, ta, td)
+						try buildClCost(p, cost_scratch, ta, td)
 					else
-						try buildClCost(cost_scratch, tl, ta);
+						try buildClCost(p, cost_scratch, tl, ta);
 					const total = built.header_bits + dp;
 					if (total < base_total and (best == null or total < best.?.total)) {
 						best = .{ .is_ll = sec.is_ll, .sv = sv, .dp = dp, .total = total };
@@ -2058,7 +1965,7 @@ const PolishResult = struct { ll: []u8, dist: []u8 };
 
 /// Return the best exact snapshot of tree lengths, or null if no sweep
 /// improves the original. The caller compares the materialized block.
-fn polishLengths(alloc: std.mem.Allocator, h: Huff) !?PolishResult {
+fn polishLengths(p: Polisher, alloc: std.mem.Allocator, h: Huff) !?PolishResult {
 	const ll = h.ll_lengths;
 	const dist = h.dist_lengths;
 	// Count actual emissions under this block's trees, including the
@@ -2078,11 +1985,11 @@ fn polishLengths(alloc: std.mem.Allocator, h: Huff) !?PolishResult {
 		},
 	};
 	llf[common.EOB] += 1;
-	if (active_optimizer_memo) |memo| {
+	if (p.memo) |memo| {
 		if (ll.len <= 288 and dist.len <= 32) {
-			const slot = memo.polishSlot(ll, dist, llf, df);
-			if (slot.valid and slot.ll_len == ll.len and slot.dist_len == dist.len and slot.t24 == cl_t24_arbitration and
-				slot.floor == min_dist_codes and
+			const slot = memo.polishSlot(p.encoder(), ll, dist, llf, df);
+			if (slot.valid and slot.ll_len == ll.len and slot.dist_len == dist.len and slot.t24 == p.extra_seeds and
+				slot.floor == p.floor and
 				std.mem.eql(u8, slot.lengths[0..ll.len], ll) and
 				std.mem.eql(u8, slot.lengths[ll.len..][0..dist.len], dist) and
 				std.mem.eql(u32, slot.freqs[0..ll.len], llf) and
@@ -2093,12 +2000,12 @@ fn polishLengths(alloc: std.mem.Allocator, h: Huff) !?PolishResult {
 				return .{ .ll = try alloc.dupe(u8, slot.result[0..slot.result_ll_len]), .dist = try alloc.dupe(u8, slot.result[slot.result_ll_len..][0..slot.result_dist_len]) };
 			}
 			memo.polish_misses += 1;
-			const result = try polishLengthsFromFreqs(alloc, ll, dist, llf, df);
+			const result = try polishLengthsFromFreqs(p, alloc, ll, dist, llf, df);
 			slot.valid = true;
 			slot.ll_len = @intCast(ll.len);
 			slot.dist_len = @intCast(dist.len);
-			slot.t24 = cl_t24_arbitration;
-			slot.floor = min_dist_codes;
+			slot.t24 = p.extra_seeds;
+			slot.floor = p.floor;
 			@memcpy(slot.lengths[0..ll.len], ll);
 			@memcpy(slot.lengths[ll.len..][0..dist.len], dist);
 			@memcpy(slot.freqs[0..ll.len], llf);
@@ -2114,13 +2021,13 @@ fn polishLengths(alloc: std.mem.Allocator, h: Huff) !?PolishResult {
 			return result;
 		}
 	}
-	return polishLengthsFromFreqs(alloc, ll, dist, llf, df);
+	return polishLengthsFromFreqs(p, alloc, ll, dist, llf, df);
 }
 
 // Only the starting lengths, symbol emission counts, CL seed mode and distance
 // floor affect this search. Extra-bit payloads and token order contribute
 // constants.
-fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_input: []const u8, llf: []const u32, df: []const u32) !?PolishResult {
+fn polishLengthsFromFreqs(p: Polisher, alloc: std.mem.Allocator, ll_input: []const u8, dist_input: []const u8, llf: []const u32, df: []const u32) !?PolishResult {
 	const ll = try alloc.dupe(u8, ll_input);
 	const dist = try alloc.dupe(u8, dist_input);
 
@@ -2129,7 +2036,7 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 	var cost_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer cost_scratch.deinit();
 
-	var built = try buildClCost(&cost_scratch, ll, dist);
+	var built = try buildClCost(p, &cost_scratch, ll, dist);
 	var best_total = built.header_bits;
 	var clc = try polishClCosts(&built.cl_lengths);
 	var best_ll: ?[]u8 = null;
@@ -2150,11 +2057,11 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 				if (v != 0) any = true;
 			}
 			if (!any) continue;
-			const res = try polishSectionPass(alloc, sec.seq, sec.freqs, &clc);
+			const res = try polishSectionPass(p.memo, alloc, sec.seq, sec.freqs, &clc);
 			cur_dp += res.dp;
 			improved = improved or res.improved;
 		}
-		built = try buildClCost(&cost_scratch, ll, dist);
+		built = try buildClCost(p, &cost_scratch, ll, dist);
 		const ex = built.header_bits;
 		clc = try polishClCosts(&built.cl_lengths);
 		if (ex + cur_dp < best_total) {
@@ -2172,7 +2079,7 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 			var improved = false;
 			const sections = [2]struct { seq: []u8, freqs: []const u32, grant_cap: usize, min_codes: usize }{
 				.{ .seq = ll, .freqs = llf, .grant_cap = 286, .min_codes = 0 },
-				.{ .seq = dist, .freqs = df, .grant_cap = 30, .min_codes = min_dist_codes },
+				.{ .seq = dist, .freqs = df, .grant_cap = 30, .min_codes = p.floor },
 			};
 			for (sections) |sec| {
 				var any = false;
@@ -2180,21 +2087,21 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 					if (v != 0) any = true;
 				}
 				if (!any) continue;
-				const res = polishStructuralPass(sec.seq, sec.freqs, &clc, sec.grant_cap, sec.min_codes);
+				const res = polishStructuralPass(p.memo, sec.seq, sec.freqs, &clc, sec.grant_cap, sec.min_codes);
 				cur_dp += res.dp;
 				improved = improved or res.improved;
 				if (res.improved or sweep > 0 or bc_round > 0) {
 					// The first sweep reuses phase A's swap/triple result if
 					// structure and screening prices are unchanged. Later
 					// sweeps and outer rounds always recheck.
-					const res2 = try polishSectionPass(alloc, sec.seq, sec.freqs, &clc);
+					const res2 = try polishSectionPass(p.memo, alloc, sec.seq, sec.freqs, &clc);
 					cur_dp += res2.dp;
 					improved = improved or res2.improved;
 				}
 			}
 			const tl = trim(ll, common.EOB + 1);
 			const td = trim(dist, 1);
-			built = try buildClCost(&cost_scratch, tl, td);
+			built = try buildClCost(p, &cost_scratch, tl, td);
 			const ex = built.header_bits;
 			clc = try polishClCosts(&built.cl_lengths);
 			if (ex + cur_dp < best_total) {
@@ -2204,7 +2111,7 @@ fn polishLengthsFromFreqs(alloc: std.mem.Allocator, ll_input: []const u8, dist_i
 			}
 			if (!improved) break;
 		}
-		const found = (try polishExactPass(alloc, &cost_scratch, ll, dist, llf, df, cur_dp)) orelse break;
+		const found = (try polishExactPass(p, alloc, &cost_scratch, ll, dist, llf, df, cur_dp)) orelse break;
 		if (found.is_ll) {
 			@memcpy(ll, found.sv);
 		} else {
@@ -2275,9 +2182,9 @@ fn decideStream(alloc: std.mem.Allocator, orig_tokens: []const Token, matches: [
 }
 
 /// The tree polish of h as a materialized candidate, or null.
-fn polishedOf(alloc: std.mem.Allocator, h: Huff) !?Huff {
-	const pol = (try polishLengths(alloc, h)) orelse return null;
-	const built = try buildCl(alloc, pol.ll, pol.dist);
+fn polishedOf(p: Polisher, alloc: std.mem.Allocator, h: Huff) !?Huff {
+	const pol = (try polishLengths(p, alloc, h)) orelse return null;
+	const built = try p.encoder().header(alloc, pol.ll, pol.dist, .full);
 	return .{
 		.is_fixed = false,
 		.tokens = h.tokens,
@@ -2292,11 +2199,11 @@ fn polishedOf(alloc: std.mem.Allocator, h: Huff) !?Huff {
 /// boundary (buildClCrossing), or null if no strict gain. Pure header
 /// re-encode — tokens and ll/dist lengths untouched — so it never changes
 /// which candidate wins arbitration; accept strict gains only.
-fn crossingOf(alloc: std.mem.Allocator, h: Huff) !?Huff {
+fn crossingOf(p: Polisher, alloc: std.mem.Allocator, h: Huff) !?Huff {
 	if (h.is_fixed) return null;
 	const cur = try clHeaderBits(&h.cl_lengths, h.cl_entries) +
 		@as(i64, @intCast((deflasm.encodingHclen(h) - hclenOf(&h.cl_lengths)) * 3));
-	const built = try buildClCrossing(alloc, h.ll_lengths, h.dist_lengths);
+	const built = try p.encoder().header(alloc, h.ll_lengths, h.dist_lengths, .crossing);
 	if (built.header_bits >= cur) return null;
 	return .{
 		.is_fixed = false,
@@ -2315,11 +2222,11 @@ const JointResult = struct { h: Huff, cost: i64 };
 /// iterate are kept-tree / canonical-rebuild / polish-of-kept, first
 /// strictly-cheaper wins;
 /// iterates are adopted on strict gain only.
-fn jointDescent(alloc: std.mem.Allocator, seed: Huff, orig_tokens: []const Token, matches: []const MatchInfo, polish_seed: bool) !JointResult {
+fn jointDescent(p: Polisher, alloc: std.mem.Allocator, seed: Huff, orig_tokens: []const Token, matches: []const MatchInfo, polish_seed: bool) !JointResult {
 	var best = seed;
 	var best_cost = try dynBlockCost(seed);
 	if (polish_seed) {
-		if (try polishedOf(alloc, seed)) |pb| {
+		if (try polishedOf(p, alloc, seed)) |pb| {
 			const c = try dynBlockCost(pb);
 			if (c < best_cost) {
 				best = pb;
@@ -2330,7 +2237,7 @@ fn jointDescent(alloc: std.mem.Allocator, seed: Huff, orig_tokens: []const Token
 	for (0..JOINT_CAP) |_| {
 		const S = (try decideStream(alloc, orig_tokens, matches, best.ll_lengths, best.dist_lengths)) orelse break;
 		if (tokensEqual(S, best.tokens)) break;
-		const built = try buildCl(alloc, best.ll_lengths, best.dist_lengths);
+		const built = try p.encoder().header(alloc, best.ll_lengths, best.dist_lengths, .full);
 		const kept: Huff = .{
 			.is_fixed = false,
 			.tokens = S,
@@ -2341,14 +2248,14 @@ fn jointDescent(alloc: std.mem.Allocator, seed: Huff, orig_tokens: []const Token
 		};
 		var it_blk = kept;
 		var it_cost = try dynBlockCost(kept);
-		const canon = (try encoder().complete(alloc, S, false, .{})).body.huff;
+		const canon = (try p.encoder().complete(alloc, S, false, .{})).body.huff;
 		const cc = try dynBlockCost(canon);
 		if (cc < it_cost) {
 			it_blk = canon;
 			it_cost = cc;
 		}
 		var pb_opt: ?Huff = null;
-		if (try polishedOf(alloc, kept)) |pb| {
+		if (try polishedOf(p, alloc, kept)) |pb| {
 			pb_opt = pb;
 			const pc2 = try dynBlockCost(pb);
 			if (pc2 < it_cost) {
@@ -2361,7 +2268,7 @@ fn jointDescent(alloc: std.mem.Allocator, seed: Huff, orig_tokens: []const Token
 		// CL runs across the literal/distance boundary.
 		const cross_cands = [_]?Huff{ kept, canon, pb_opt };
 		for (cross_cands) |co| {
-			if (co) |c| if (try crossingOf(alloc, c)) |xb| {
+			if (co) |c| if (try crossingOf(p, alloc, c)) |xb| {
 				const xc = try dynBlockCost(xb);
 				if (xc < it_cost) {
 					it_blk = xb;
@@ -2386,9 +2293,9 @@ fn litTokens(alloc: std.mem.Allocator, raw: []const u8) ![]Token {
 }
 
 /// As-is block cost at the current output offset, including encoding metadata.
-fn blockCost(block: Block) !i64 {
+fn blockCost(offset: u3, block: Block) !i64 {
 	return switch (block.body) {
-		.stored => |data| storedCost(data),
+		.stored => |data| storedCost(offset, data),
 		.huff => |h| if (h.is_fixed) fixedCost(h.tokens, h.encoding != null) else try dynBlockCost(h),
 	};
 }
@@ -2413,14 +2320,14 @@ fn blockFromBytes(a: std.mem.Allocator, bytes: []const u8) !Block {
 	return deflasm.parseBlock(&reader, a);
 }
 
-/// Complete encoded reads are pure only under the same decoded block and prior
-/// dictionary. Binding compares and owns those bytes, not a digest or a caller's
-/// pointer. Evicting entries keeps this binding alive in its separate arena.
+/// Encoded reads depend on decoded bytes, history, offset and distance floor.
+/// Binding owns the bytes; eviction preserves that binding in a separate arena.
 const ProjectionMemo = struct {
 	inputs: std.heap.ArenaAllocator,
 	arena: std.heap.ArenaAllocator,
 	bound: bool = false,
 	offset: u3 = 0,
+	floor: u8 = 2,
 	raw: []const u8 = &.{},
 	prior: []const u8 = &.{},
 	caches: [3]std.StringHashMapUnmanaged([]const u8) = .{ .empty, .empty, .empty },
@@ -2439,14 +2346,16 @@ const ProjectionMemo = struct {
 		self.cached_bytes = 0;
 	}
 
-	fn bind(self: *ProjectionMemo, raw: []const u8, prior: []const u8) !void {
-		if (self.bound and self.offset == block_offset and std.mem.eql(u8, self.raw, raw) and std.mem.eql(u8, self.prior, prior)) return;
+	fn bind(self: *ProjectionMemo, raw: []const u8, prior: []const u8, p: Polisher) !void {
+		std.debug.assert(!p.extra_seeds);
+		if (self.bound and self.offset == p.offset and self.floor == p.floor and std.mem.eql(u8, self.raw, raw) and std.mem.eql(u8, self.prior, prior)) return;
 		self.bound = false;
 		self.clear();
 		_ = self.inputs.reset(.free_all);
 		self.raw = try self.inputs.allocator().dupe(u8, raw);
 		self.prior = try self.inputs.allocator().dupe(u8, prior);
-		self.offset = block_offset;
+		self.offset = p.offset;
+		self.floor = p.floor;
 		self.bound = true;
 	}
 
@@ -2462,13 +2371,14 @@ const ProjectionMemo = struct {
 	}
 };
 
-test "projection memo isolates decoded bytes history grades and eviction ownership" {
+test "projection memo isolates bytes history offsets floors grades and ownership" {
 	const a = std.testing.allocator;
 	var memo: ProjectionMemo = .{ .inputs = std.heap.ArenaAllocator.init(a), .arena = std.heap.ArenaAllocator.init(a), .limit = 24 };
 	defer memo.deinit();
+	var offset: u3 = 0;
 	var raw = [_]u8{ 65, 65, 65 };
 	var prior = [_]u8{65};
-	try memo.bind(&raw, &prior);
+	try memo.bind(&raw, &prior, .{ .offset = offset });
 	try memo.remember(.full, "in", "full");
 	try memo.remember(.single, "in", "single");
 	try std.testing.expectEqualStrings("full", memo.caches[0].get("in").?);
@@ -2476,32 +2386,34 @@ test "projection memo isolates decoded bytes history grades and eviction ownersh
 	try std.testing.expect(memo.caches[2].get("in") == null);
 	// Matching contents keep work; a caller mutating the same storage must
 	// invalidate it, proving the binding owns values rather than pointers.
-	try memo.bind(&raw, &prior);
+	try memo.bind(&raw, &prior, .{ .offset = offset });
 	try std.testing.expect(memo.caches[0].contains("in"));
 	raw[0] = 66;
-	try memo.bind(&raw, &prior);
+	try memo.bind(&raw, &prior, .{ .offset = offset });
 	try std.testing.expect(!memo.caches[0].contains("in"));
 	try memo.remember(.full, "in", "new");
 	prior[0] = 66;
-	try memo.bind(&raw, &prior);
+	try memo.bind(&raw, &prior, .{ .offset = offset });
 	try std.testing.expect(!memo.caches[0].contains("in"));
 	try memo.remember(.full, "in", "new");
 	try memo.remember(.full, "another", "123456789012");
 	try memo.remember(.single, "third", "fourth");
 	try std.testing.expect(!memo.caches[0].contains("in"));
 	try std.testing.expectEqualStrings("fourth", memo.caches[1].get("third").?);
-	try memo.bind(&raw, &prior);
+	try memo.bind(&raw, &prior, .{ .offset = offset });
 	try std.testing.expect(memo.caches[1].contains("third"));
 	try std.testing.expectEqualSlices(u8, &raw, memo.raw);
 	try std.testing.expectEqualSlices(u8, &prior, memo.prior);
-	const previous = block_offset;
-	defer block_offset = previous;
-	block_offset = 3;
-	try memo.bind(&raw, &prior);
+	offset = 3;
+	try memo.bind(&raw, &prior, .{ .offset = offset });
 	try std.testing.expect(!memo.caches[1].contains("third"));
+	try memo.remember(.full, "in", "floored");
+	try memo.bind(&raw, &prior, .{ .offset = offset, .floor = 0 });
+	try std.testing.expect(!memo.caches[0].contains("in"));
 }
 
 test "caller memo preserves block results across warm calls and changed history" {
+	const p: Polisher = .{};
 	var memo = try OptimizerMemo.init(std.testing.allocator, 16);
 	defer memo.deinit();
 	const references = [_]Token{ .{ .match = .{ .length = 9, .distance = 1 } }, .{ .lit = 67 } };
@@ -2518,17 +2430,14 @@ test "caller memo preserves block results across warm calls and changed history"
 		};
 		defer for (&states) |*state| state.deinit();
 		const a = arena.allocator();
-		const block = try encoder().complete(a, &references, true, .{});
-		const old = swapOptimizerMemo(null);
-		defer _ = swapOptimizerMemo(old);
-		const cold = try optimizeBlock(a, &sub, &states, block, prior);
+		const block = try p.encoder().complete(a, &references, true, .{});
+
+		const cold = try optimizeBlock(.{}, a, &sub, &states, block, prior, 0);
 		const expected = try blockBytes(a, cold.block);
-		_ = swapOptimizerMemo(&memo);
 		for (0..2) |_| {
-			const warm = try optimizeBlock(a, &sub, &states, block, prior);
+			const warm = try optimizeBlock(.{ .memo = &memo }, a, &sub, &states, block, prior, 0);
 			try std.testing.expectEqualStrings(expected, try blockBytes(a, warm.block));
 			try std.testing.expectEqualSlices(u8, cold.raw, warm.raw);
-			try std.testing.expect(active_optimizer_memo == &memo);
 		}
 	}
 }
@@ -2549,24 +2458,27 @@ test "confirmation margin compares accepted i64 extremes without overflow" {
 }
 
 const ReparseContext = struct {
+	polisher: Polisher,
+	read: ExploreRead,
+	stats: *ExploreStats,
 	sub: *std.heap.ArenaAllocator,
 	states: *[2]std.heap.ArenaAllocator,
 	graph: ir.Graph,
 	projection: *ProjectionMemo,
 
-	fn feedbackGrade() ExploreRead.Grade {
-		return explore_read.feedback_grade orelse explore_read.grade;
+	fn feedbackGrade(self: *const ReparseContext) ExploreRead.Grade {
+		return self.read.feedback_grade orelse self.read.grade;
 	}
 
 	/// Whether the feedback controller's read of `encoded` is already cached.
 	pub fn cached(self: *ReparseContext, encoded: []const u8) bool {
-		return self.projection.caches[@intFromEnum(feedbackGrade())].contains(encoded);
+		return self.projection.caches[@intFromEnum(self.feedbackGrade())].contains(encoded);
 	}
 
 	/// The feedback controller's exploration read: production's full
 	/// projection unless a research grade is selected (`ExploreRead`).
 	pub fn polishEncoded(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8) !Block {
-		return self.polishEncodedGrade(a, encoded, feedbackGrade());
+		return self.polishEncodedGrade(a, encoded, self.feedbackGrade());
 	}
 
 	/// A single-pass read of `encoded`, for admitting non-fixed-point contexts.
@@ -2579,34 +2491,34 @@ const ReparseContext = struct {
 	/// `winner_always`. Null when that consumer's grade is already full or the
 	/// candidate is not worth confirming. Every adopted record passes here.
 	pub fn confirmEncoded(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8, cheap_bits: i64, record_bits: i64, walk: bool) !?Block {
-		const er = explore_read;
-		const grade = if (walk) er.grade else feedbackGrade();
+		const er = self.read;
+		const grade = if (walk) er.grade else self.feedbackGrade();
 		if (grade == .full) return null;
 		if (!((walk and er.winner_always) or withinConfirmMargin(cheap_bits, record_bits, er.margin))) return null;
 		const rich = try self.polishEncodedGrade(a, encoded, .full);
-		explore_stats.confirms += 1;
-		if (try blockCost(rich) < cheap_bits) explore_stats.confirm_gains += 1;
+		self.stats.confirms += 1;
+		if (try blockCost(self.polisher.offset, rich) < cheap_bits) self.stats.confirm_gains += 1;
 		return rich;
 	}
 
 	fn polishEncodedGrade(self: *ReparseContext, a: std.mem.Allocator, encoded: []const u8, grade: ExploreRead.Grade) !Block {
 		const g = @intFromEnum(grade);
 		if (self.projection.caches[g].get(encoded)) |value| {
-			explore_stats.hits[g] += 1;
+			self.stats.hits[g] += 1;
 			return blockFromBytes(a, value);
 		}
-		explore_stats.reads[g] += 1;
+		self.stats.reads[g] += 1;
 		// Assembly/reparse is a projection boundary: the old portfolio must
 		// see precisely the encoding a fresh external invocation would see.
 		const normalized = try blockFromBytes(a, encoded);
 		const polished = switch (grade) {
-			.full => try optimizeBlockFast(a, self.sub, self.states, normalized, self.graph.program),
+			.full => try optimizeBlockFast(self.polisher, a, self.sub, self.states, normalized, self.graph.program),
 			.single => blk: {
 				// One classic configuration pass: no restart closure or expanded seed portfolio.
-				std.debug.assert(!cl_t24_arbitration);
+				std.debug.assert(!self.polisher.extra_seeds);
 				_ = self.sub.reset(SCRATCH_RESET);
 				const pc = try precomputeBlock(self.sub.allocator(), normalized, self.graph.program);
-				const pass = try optimizeBlockCfg(self.sub.allocator(), normalized, pc);
+				const pass = try optimizeBlockCfg(self.polisher, self.sub.allocator(), normalized, pc);
 				self.graph.program.check(pass.block);
 				break :blk pass;
 			},
@@ -2618,7 +2530,7 @@ const ReparseContext = struct {
 		};
 		const output = try blockBytes(a, polished.block);
 		const result = try blockFromBytes(a, output);
-		if (try blockCost(result) != polished.bits) @panic("reparse serialized cost mismatch");
+		if (try blockCost(self.polisher.offset, result) != polished.bits) @panic("reparse serialized cost mismatch");
 		try self.projection.remember(grade, encoded, output);
 		return result;
 	}
@@ -2632,7 +2544,7 @@ const ReparseContext = struct {
 		// and incumbent can refer to those immutable bytes directly.
 		var current = try blockBytes(sa, seed);
 		var best = current;
-		var best_bits = try blockCost(seed);
+		var best_bits = try blockCost(self.polisher.offset, seed);
 		try seen.put(sa, current, {});
 		var round_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 		defer round_arena.deinit();
@@ -2642,29 +2554,29 @@ const ReparseContext = struct {
 			const state = try blockFromBytes(ra, current);
 			if (state.body != .huff) break;
 			const h = state.body.huff;
-			const prices = try reparse.prices(encoder(), ra, h, .{}, 0, @splat(false));
+			const prices = try reparse.prices(self.polisher.encoder(), ra, h, .{}, 0, @splat(false));
 			const parsed = reparse.parse(ra, self.graph, prices) catch |err| switch (err) {
 				error.NonFiniteCost => @panic("finite scale-zero reparse costs overflowed"),
 				error.OutOfMemory => return error.OutOfMemory,
 			};
-			const er = explore_read;
+			const er = self.read;
 			const nvariants: usize = if (h.is_fixed) 1 else 2;
 			var chosen: Block = undefined;
 			var chosen_bits: i64 = std.math.maxInt(i64);
 			var chosen_bytes: []const u8 = &.{};
 			var costs: [2][3]i64 = .{ .{ 0, 0, 0 }, .{ 0, 0, 0 } };
 			for (0..nvariants) |v| {
-				const variant = try encoder().complete(ra, parsed.tokens, seed.is_last, .{
+				const variant = try self.polisher.encoder().complete(ra, parsed.tokens, seed.is_last, .{
 					.trees = if (v == 0) .{ .fresh = .standard } else .{ .merge = .{ .previous = h } },
 					.header = if (v == 0) .full else .crossing,
 				});
 				const vbytes = try blockBytes(ra, variant);
 				const polished = try self.polishEncodedGrade(ra, vbytes, er.grade);
-				const cost = try blockCost(polished);
+				const cost = try blockCost(self.polisher.offset, polished);
 				costs[v][@intFromEnum(er.grade)] = cost;
 				if (er.grade == .full and er.measure_agreement) {
 					for ([_]ExploreRead.Grade{ .single, .assemble }) |g| {
-						costs[v][@intFromEnum(g)] = try blockCost(try self.polishEncodedGrade(ra, vbytes, g));
+						costs[v][@intFromEnum(g)] = try blockCost(self.polisher.offset, try self.polishEncodedGrade(ra, vbytes, g));
 					}
 				}
 				if (cost < chosen_bits) {
@@ -2673,22 +2585,22 @@ const ReparseContext = struct {
 					chosen_bytes = vbytes;
 				}
 			}
-			explore_stats.rounds += 1;
+			self.stats.rounds += 1;
 			if (er.grade == .full and er.measure_agreement and nvariants == 2) {
 				// Do the cheap grades rank the two variants as the full read does?
 				if (costs[0][0] == costs[1][0]) {
-					explore_stats.full_ties += 1;
+					self.stats.full_ties += 1;
 				} else {
 					const full_pick: usize = if (costs[1][0] < costs[0][0]) 1 else 0;
 					for (1..3) |g| {
 						const pick: usize = if (costs[1][g] < costs[0][g]) 1 else 0;
-						if (pick == full_pick) explore_stats.agree[g] += 1 else explore_stats.disagree[g] += 1;
+						if (pick == full_pick) self.stats.agree[g] += 1 else self.stats.disagree[g] += 1;
 					}
 				}
 			}
 			if (try self.confirmEncoded(ra, chosen_bytes, chosen_bits, best_bits, true)) |rich| {
 				chosen = rich;
-				chosen_bits = try blockCost(rich);
+				chosen_bits = try blockCost(self.polisher.offset, rich);
 			}
 			const bytes = try blockBytes(ra, chosen);
 			// Equality, not a digest alone, decides whether the walk repeats.
@@ -2701,7 +2613,7 @@ const ReparseContext = struct {
 			if (entry.found_existing) break;
 			current = entry.key_ptr.*;
 		}
-		if (best_bits > try blockCost(seed)) @panic("reparse lost its incumbent");
+		if (best_bits > try blockCost(self.polisher.offset, seed)) @panic("reparse lost its incumbent");
 		return blockFromBytes(a, best);
 	}
 };
@@ -2731,26 +2643,24 @@ fn satisfiesDistFloor(result: Block, input: Block, want: u8) bool {
 }
 
 /// The unfloored winner's distance tree completed to the floor: the empty
-/// form becomes `want` 1-bit codes, a lone code gets its 1-bit filler at the
+/// form becomes `p.floor` 1-bit codes, a lone code gets its 1-bit filler at the
 /// lowest absent index, the CL section is rebuilt, tokens are unchanged. Its
 /// cost is the unfloored result plus the repair's few header bits, so the
 /// floored search seeded from it can never lose more than that.
-fn repairDistFloor(alloc: std.mem.Allocator, result: Block, want: u8) !Block {
+fn repairDistFloor(p: Polisher, alloc: std.mem.Allocator, result: Block) !Block {
 	var h = result.body.huff;
 	std.debug.assert(!h.is_fixed);
 	var full = [_]u8{0} ** 30;
 	@memcpy(full[0..h.dist_lengths.len], h.dist_lengths);
 	const n = countNonzero(&full);
 	if (n == 0) {
-		for (full[0..want]) |*l| l.* = 1;
+		for (full[0..p.floor]) |*l| l.* = 1;
 	} else if (n == 1) {
-		const previous = swapMinDistCodes(want);
-		defer _ = swapMinDistCodes(previous);
-		distFloor(&full);
+		encoding.applyFloor(&full, p.floor);
 	}
-	std.debug.assert(countNonzero(&full) >= want);
+	std.debug.assert(countNonzero(&full) >= p.floor);
 	h.dist_lengths = try alloc.dupe(u8, trim(&full, 1));
-	const built = try buildCl(alloc, h.ll_lengths, h.dist_lengths);
+	const built = try p.encoder().header(alloc, h.ll_lengths, h.dist_lengths, .full);
 	h.cl_lengths = built.cl_lengths;
 	h.cl_entries = built.entries.items;
 	h.encoding = null;
@@ -2762,29 +2672,23 @@ fn repairDistFloor(alloc: std.mem.Allocator, result: Block, want: u8) !Block {
 /// and the repaired winner; ties prefer the input seed. Repeat from strict
 /// improvements so the result is a fixed point. Strictly decreasing bits bound
 /// the restart loop; the repaired seed bounds the floor's cost.
-fn optimizeBlockAtOffset(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, prior: []const u8, offset: u3) !OptResult {
-	const previous = block_offset;
-	block_offset = offset;
-	defer block_offset = previous;
-	return optimizeBlock(alloc, sub, states, block, prior);
-}
-
-fn optimizeBlock(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, prior: []const u8) !OptResult {
+fn optimizeBlock(options: Options, alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, prior: []const u8, offset: u3) !OptResult {
 	const program = try ir.Program.decode(alloc, block, prior);
-	const want = min_dist_codes;
-	if (want == 0) return optimizeBlockAt(alloc, sub, states, block, program);
+	const want = options.min_dist_codes;
+	const p: Polisher = .{ .floor = want, .memo = options.memo, .offset = offset };
+	if (want == 0) return optimizeBlockAt(options, alloc, sub, states, block, program, offset);
 	var current = block;
-	var current_bits = try blockCost(block);
+	var current_bits = try blockCost(p.offset, block);
 	while (true) {
 		const unfloored = blk: {
-			const previous = swapMinDistCodes(0);
-			defer _ = swapMinDistCodes(previous);
-			break :blk try optimizeBlockAt(alloc, sub, states, current, program);
+			var unfloored_options = options;
+			unfloored_options.min_dist_codes = 0;
+			break :blk try optimizeBlockAt(unfloored_options, alloc, sub, states, current, program, offset);
 		};
 		if (satisfiesDistFloor(unfloored.block, current, want)) return unfloored;
-		var floored = try optimizeBlockAt(alloc, sub, states, current, program);
-		const repaired = try repairDistFloor(alloc, unfloored.block, want);
-		const from_repair = try optimizeBlockAt(alloc, sub, states, repaired, program);
+		var floored = try optimizeBlockAt(options, alloc, sub, states, current, program, offset);
+		const repaired = try repairDistFloor(p, alloc, unfloored.block);
+		const from_repair = try optimizeBlockAt(options, alloc, sub, states, repaired, program, offset);
 		if (from_repair.bits < floored.bits) floored = from_repair;
 		if (floored.bits > current_bits) @panic("floored search grew its seed");
 		if (floored.bits == current_bits) return floored;
@@ -2794,29 +2698,31 @@ fn optimizeBlock(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states
 	}
 }
 
-fn optimizeBlockAt(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, program: ir.Program) !OptResult {
+fn optimizeBlockAt(options: Options, alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, program: ir.Program, offset: u3) !OptResult {
 	// Share exact work from the initial portfolio through reparsing. A caller
 	// may supply a wider scope; search state and budgets are never cached.
-	var memo: ?OptimizerMemo = if (reparse_enabled and active_optimizer_memo == null)
+	var memo: ?OptimizerMemo = if (options.reparse and options.memo == null)
 		OptimizerMemo.init(std.heap.page_allocator, 8192) catch |err| switch (err) {
 			error.InvalidCapacity => unreachable,
 			error.OutOfMemory => return error.OutOfMemory,
 		}
 	else null;
 	defer if (memo) |*owned| owned.deinit();
-	const old_memo = if (memo) |*owned| swapOptimizerMemo(owned) else active_optimizer_memo;
-	defer _ = swapOptimizerMemo(old_memo);
-	const baseline = try optimizeBlockFast(alloc, sub, states, block, program);
-	if (!reparse_enabled or baseline.block.body != .huff or baseline.raw.len < 3 or baseline.raw.len > REPARSE_MAX_RAW) return baseline;
+	const p: Polisher = .{ .floor = options.min_dist_codes, .offset = offset,
+		.memo = if (memo) |*owned| owned else options.memo };
+	const baseline = try optimizeBlockFast(p, alloc, sub, states, block, program);
+	if (!options.reparse or baseline.block.body != .huff or baseline.raw.len < 3 or baseline.raw.len > REPARSE_MAX_RAW) return baseline;
 	var search_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer search_arena.deinit();
 	var production_feedback: FeedbackSession = .{ .a = search_arena.allocator(),
-		.options = .{ .evaluations = FEEDBACK_EVALUATIONS, .order = feedback_policy.order, .cheap_contexts = feedback_policy.cheap_contexts }, .record_trials = false };
-	const selected_feedback = feedback_session orelse &production_feedback;
-	const projection = &active_optimizer_memo.?.projection;
-	try projection.bind(program.raw(), program.prior());
+		.options = .{ .evaluations = FEEDBACK_EVALUATIONS, .order = options.feedback_policy.order, .cheap_contexts = options.feedback_policy.cheap_contexts }, .record_trials = false };
+	const selected_feedback = options.feedback_session orelse &production_feedback;
+	const projection = &p.memo.?.projection;
+	try projection.bind(program.raw(), program.prior(), p);
+	var local_stats: ExploreStats = .{};
 	var ctx: ReparseContext = .{
-		.sub = sub, .states = states,
+		.sub = sub, .states = states, .polisher = p,
+		.read = options.explore_read, .stats = options.stats orelse &local_stats,
 		.graph = try reparse.candidatesForProgram(search_arena.allocator(), program),
 		.projection = projection,
 	};
@@ -2831,11 +2737,11 @@ fn optimizeBlockAt(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, stat
 	while (true) {
 		_ = winners[next].reset(SCRATCH_RESET);
 		var candidate = try ctx.search(winners[next].allocator(), current);
-		var candidate_cost = try blockCost(candidate);
+		var candidate_cost = try blockCost(p.offset, candidate);
 		if (candidate_cost > cost) @panic("reparse search grew its seed");
 		if (candidate_cost == cost) {
-			candidate = try feedback.run(winners[next].allocator(), candidate, ctx.graph, encoder(), &ctx, selected_feedback);
-			candidate_cost = try blockCost(candidate);
+			candidate = try feedback.run(winners[next].allocator(), candidate, ctx.graph, p.encoder(), &ctx, selected_feedback);
+			candidate_cost = try blockCost(p.offset, candidate);
 			if (candidate_cost > cost) @panic("feedback search grew its incumbent");
 			if (candidate_cost == cost) break;
 		}
@@ -2849,13 +2755,13 @@ fn optimizeBlockAt(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, stat
 /// Restart the full portfolio from each strictly cheaper emitted winner.
 /// Alternating state arenas retain only the current and next pass; their
 /// capacity is reused across blocks by the fused stream driver.
-fn optimizeBlockFast(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, program: ir.Program) !OptResult {
+fn optimizeBlockFast(p: Polisher, alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator, block: Block, program: ir.Program) !OptResult {
 	var current = block;
-	var cost = try blockCost(block);
+	var cost = try blockCost(p.offset, block);
 	var next: usize = 0;
 	while (true) {
 		_ = states[next].reset(SCRATCH_RESET);
-		const candidate = try optimizeBlockPass(states[next].allocator(), sub, current, program);
+		const candidate = try optimizeBlockPass(p, states[next].allocator(), sub, current, program);
 		std.debug.assert(candidate.bits >= 0 and candidate.bits <= cost);
 		if (candidate.bits == cost) {
 			return .{
@@ -2873,22 +2779,22 @@ fn optimizeBlockFast(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, st
 /// CL seed union: run the complete pipeline under both CL-arbitration configs;
 /// choose the smaller result, retaining classic on ties. Neither config
 /// dominates, so convergence must restart their union, not just one config.
-fn optimizeBlockPass(alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, block: Block, program: ir.Program) !OptResult {
+fn optimizeBlockPass(p: Polisher, alloc: std.mem.Allocator, sub: *std.heap.ArenaAllocator, block: Block, program: ir.Program) !OptResult {
 	// Both configurations read the same verified parse analysis. Search churn
 	// lives in `sub`, reset between configurations; the analysis and copied
 	// winner live in the caller's state arena until the next restart.
 	_ = sub.reset(SCRATCH_RESET);
 	const pc = try precomputeBlock(alloc, block, program);
-	const classic_s = try optimizeBlockCfg(sub.allocator(), block, pc);
+	const classic_s = try optimizeBlockCfg(p, sub.allocator(), block, pc);
 	const classic: OptResult = .{
 		.block = try dupeBlock(alloc, classic_s.block),
 		.raw = program.raw(),
 		.bits = classic_s.bits,
 	};
 	_ = sub.reset(SCRATCH_RESET);
-	cl_t24_arbitration = true;
-	defer cl_t24_arbitration = false;
-	const t24_s = try optimizeBlockCfg(sub.allocator(), block, pc);
+	var expanded = p;
+	expanded.extra_seeds = true;
+	const t24_s = try optimizeBlockCfg(expanded, sub.allocator(), block, pc);
 	if (t24_s.bits < classic.bits) {
 		return .{ .block = try dupeBlock(alloc, t24_s.block), .raw = classic.raw, .bits = t24_s.bits };
 	}
@@ -2904,14 +2810,14 @@ const StreamPortfolio = struct {
 	all_dynamic_cost: i64,
 	all_fixed_cost: i64,
 };
-fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamPortfolio {
+fn buildStreamPortfolio(p: Polisher, alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamPortfolio {
 	const orig_tokens = pc.tokens;
 	const raw = pc.raw;
 	// Each search runs under both CL cost models (see optDynamic's baseline
 	// comment): greedy cascades where the exact model stalls; neither
 	// dominates. Candidate order determines equal-cost ties.
-	const dyn_tokens = try optDynamic(alloc, orig_tokens, pc.matches, pc.base_ll_freq, false, .greedy);
-	const dyn_tokens_dp = try optDynamic(alloc, orig_tokens, pc.matches, pc.base_ll_freq, false, .search);
+	const dyn_tokens = try optDynamic(p, alloc, orig_tokens, pc.matches, pc.base_ll_freq, false, .greedy);
+	const dyn_tokens_dp = try optDynamic(p, alloc, orig_tokens, pc.matches, pc.base_ll_freq, false, .search);
 	const fix = try optFixed(alloc, orig_tokens, pc.matches);
 
 	var raw_freq = [_]u32{0} ** 286;
@@ -2920,7 +2826,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 	var raw_ll_freq: [286]u32 = raw_freq;
 	if (raw_ll_freq[common.EOB] == 0) raw_ll_freq[common.EOB] = 1;
 	var empty_dist = [_]u32{0} ** 30;
-	const all_dyn_cost = try dynCostFromFreqs(alloc, &raw_ll_freq, &empty_dist, 0, .full);
+	const all_dyn_cost = try p.encoder().costFromFreqs(alloc, &raw_ll_freq, &empty_dist, 0, .full);
 
 	// Drop-285 search: gate on the INPUT holding a length-258 match to
 	// reroute (the identity stream below is a
@@ -2935,8 +2841,8 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 	var drop_tokens: ?[]Token = null;
 	var drop_tokens_dp: ?[]Token = null;
 	if (has_258_orig) {
-		drop_tokens = try optDynamic(alloc, orig_tokens, pc.matches, pc.base_ll_freq, true, .greedy);
-		drop_tokens_dp = try optDynamic(alloc, orig_tokens, pc.matches, pc.base_ll_freq, true, .search);
+		drop_tokens = try optDynamic(p, alloc, orig_tokens, pc.matches, pc.base_ll_freq, true, .greedy);
+		drop_tokens_dp = try optDynamic(p, alloc, orig_tokens, pc.matches, pc.base_ll_freq, true, .search);
 	}
 
 	// Dynamic-encoding candidates: each distinct token stream (keep-search
@@ -2945,7 +2851,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 	// LAST: it may only win strictly, never steal a tie) × each routing
 	// (keep-285, plus drop-285 with per-match / flat-+1 tree weightings when
 	// the stream holds a 258-match). Keep the first candidate on ties.
-	const bidir_tokens = try optDynamicBidir(alloc, orig_tokens, pc.matches, pc.base_ll_freq);
+	const bidir_tokens = try optDynamicBidir(p, alloc, orig_tokens, pc.matches, pc.base_ll_freq);
 	var streams: [6][]const Token = undefined;
 	var ns: usize = 0;
 	streams[ns] = dyn_tokens;
@@ -2975,7 +2881,7 @@ fn buildStreamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !St
 		};
 		const n_rt: usize = if (has258) all_routings.len else 1;
 		for (all_routings[0..n_rt]) |rt| {
-			const cand = try encoder().complete(alloc, toks, block.is_last, .{ .trees = .{ .fresh = rt } });
+			const cand = try p.encoder().complete(alloc, toks, block.is_last, .{ .trees = .{ .fresh = rt } });
 			const cost = try dynBlockCost(cand.body.huff);
 			if (cost < dyn_cost) {
 				dyn_blk = cand;
@@ -2993,16 +2899,16 @@ fn cloneStreamPortfolio(alloc: std.mem.Allocator, p: StreamPortfolio) !StreamPor
 }
 const PORTFOLIO_MAX_ENTRY_BYTES = 256 * 1024;
 
-fn streamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamPortfolio {
+fn streamPortfolio(p: Polisher, alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamPortfolio {
 	const orig_tokens = pc.tokens;
-	const memo = active_optimizer_memo orelse return buildStreamPortfolio(alloc, block, pc);
-	if (!memo.portfolio_enabled) return buildStreamPortfolio(alloc, block, pc);
+	const memo = p.memo orelse return buildStreamPortfolio(p, alloc, block, pc);
+	if (!memo.portfolio_enabled) return buildStreamPortfolio(p, alloc, block, pc);
 	const key = try alloc.alloc(u64, orig_tokens.len);
 	for (orig_tokens, key) |tok, *value| value.* = switch (tok) {
 		.lit => |b| b,
 		.match => |m| (@as(u64, 1) << 63) | (@as(u64, m.length) << 17) | (@as(u64, m.distance) << 1) | @intFromBool(m.original_alt258),
 	};
-	const flags: u8 = @intFromBool(block.is_last) | (@as(u8, @intFromBool(cl_t24_arbitration)) << 1) | (min_dist_codes << 2);
+	const flags: u8 = @intFromBool(block.is_last) | (@as(u8, @intFromBool(p.extra_seeds)) << 1) | (p.floor << 2);
 	var hash = std.hash.Wyhash.init(flags);
 	hash.update(std.mem.sliceAsBytes(key));
 	hash.update(pc.raw);
@@ -3012,7 +2918,7 @@ fn streamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamP
 		return cloneStreamPortfolio(alloc, slot.portfolio);
 	}
 	memo.portfolio_misses += 1;
-	const result = try buildStreamPortfolio(alloc, block, pc);
+	const result = try buildStreamPortfolio(p, alloc, block, pc);
 	// Bound retained payload, not just entry count. Trees/entries add less
 	// than 4 KiB; arena capacity overhead is included in storageBytes().
 	const bytes = key.len * @sizeOf(u64) + pc.raw.len + (result.dynamic.body.huff.tokens.len + result.fixed.tokens.len) * @sizeOf(Token) + 4096;
@@ -3030,31 +2936,30 @@ fn streamPortfolio(alloc: std.mem.Allocator, block: Block, pc: Precomp) !StreamP
 }
 
 test "stream portfolio memo isolates mode keys history and caller ownership" {
+	var p: Polisher = .{};
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
 	var memo = try OptimizerMemo.init(std.testing.allocator, 1);
 	defer memo.deinit();
-	const previous_memo = swapOptimizerMemo(&memo);
-	defer _ = swapOptimizerMemo(previous_memo);
-	const previous_mode = cl_t24_arbitration;
-	defer cl_t24_arbitration = previous_mode;
+	p.memo = &memo;
+
 	var tokens = [_]Token{ .{ .lit = 65 }, .{ .match = .{ .length = common.MAX_MATCH_LENGTH, .distance = 1 } }, .{ .lit = 66 } };
 	for ([_]bool{ false, true }) |mode| {
-		cl_t24_arbitration = mode;
+		p.extra_seeds = mode;
 		for ([_]bool{ false, true }) |last| {
 			for ([_]bool{ false, true }) |spelling| {
 				tokens[1].match.original_alt258 = spelling;
-				const block = try encoder().complete(a, &tokens, last, .{});
+				const block = try p.encoder().complete(a, &tokens, last, .{});
 				const pc = try precomputeMatchLits(a, &tokens, try ir.Program.decode(a, block, &.{}));
-				const expected = try buildStreamPortfolio(a, block, pc);
+				const expected = try buildStreamPortfolio(p, a, block, pc);
 				const misses = memo.portfolio_misses;
-				var first = try streamPortfolio(a, block, pc);
+				var first = try streamPortfolio(p, a, block, pc);
 				try std.testing.expectEqual(misses + 1, memo.portfolio_misses);
 				try std.testing.expectEqualDeep(expected, first);
 				first.dynamic.body.huff.ll_lengths[65] +%= 1;
 				const hits = memo.portfolio_hits;
-				const second = try streamPortfolio(a, block, pc);
+				const second = try streamPortfolio(p, a, block, pc);
 				try std.testing.expectEqual(hits + 1, memo.portfolio_hits);
 				try std.testing.expectEqualDeep(expected, second);
 			}
@@ -3063,14 +2968,14 @@ test "stream portfolio memo isolates mode keys history and caller ownership" {
 	// History matters through the expanded bytes. Same tokens with different
 	// expansions must miss; repeated reads and irrelevant history must hit.
 	const references = [_]Token{.{ .match = .{ .length = 3, .distance = 1 } }};
-	const block = try encoder().complete(a, &references, true, .{});
+	const block = try p.encoder().complete(a, &references, true, .{});
 	const hits = memo.portfolio_hits;
 	for ([_][]const u8{ "A", "B", "XA", "YA" }) |prior| {
 		const pc = try precomputeMatchLits(a, &references, try ir.Program.decode(a, block, prior));
-		const expected = try buildStreamPortfolio(a, block, pc);
-		try std.testing.expectEqualDeep(expected, try streamPortfolio(a, block, pc));
+		const expected = try buildStreamPortfolio(p, a, block, pc);
+		try std.testing.expectEqualDeep(expected, try streamPortfolio(p, a, block, pc));
 		const warm_hits = memo.portfolio_hits;
-		try std.testing.expectEqualDeep(expected, try streamPortfolio(a, block, pc));
+		try std.testing.expectEqualDeep(expected, try streamPortfolio(p, a, block, pc));
 		try std.testing.expectEqual(warm_hits + 1, memo.portfolio_hits);
 	}
 	try std.testing.expectEqual(hits + 5, memo.portfolio_hits);
@@ -3084,18 +2989,18 @@ fn precomputeBlock(alloc: std.mem.Allocator, block: Block, program: ir.Program) 
 	return precomputeMatchLits(alloc, tokens, program);
 }
 
-fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptResult {
+fn optimizeBlockCfg(p: Polisher, alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptResult {
 	const orig_tokens = pc.tokens;
 	const raw = pc.raw;
 
-	const portfolio = try streamPortfolio(alloc, block, pc);
+	const portfolio = try streamPortfolio(p, alloc, block, pc);
 	const dyn_blk = portfolio.dynamic;
 	const dyn_cost = portfolio.dynamic_cost;
 	const fix = portfolio.fixed;
 	const all_dyn_cost = portfolio.all_dynamic_cost;
 	const all_fix_cost = portfolio.all_fixed_cost;
-	const stor_cost = storedCost(raw);
-	const orig_cost = try blockCost(block);
+	const stor_cost = storedCost(p.offset, raw);
+	const orig_cost = try blockCost(p.offset, block);
 
 	// Keep the input's trees, re-encode the CL section, and
 	// re-decide the stream under the kept codes. With the trees fixed the
@@ -3108,7 +3013,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 			// Every match symbol is coded in the input trees, so decideStream
 			// always produces a candidate under those trees.
 			const out = (try decideStream(alloc, orig_tokens, pc.matches, h.ll_lengths, h.dist_lengths)).?;
-			const built = try buildCl(alloc, h.ll_lengths, h.dist_lengths);
+			const built = try p.encoder().header(alloc, h.ll_lengths, h.dist_lengths, .full);
 			const rb: Block = .{ .is_last = block.is_last, .body = .{ .huff = .{
 				.is_fixed = false,
 				.tokens = out,
@@ -3136,7 +3041,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 			break :blk .{ .block = fixedHuffBlock(fix.tokens, block.is_last), .raw = raw };
 		}
 		if (best == all_dyn_cost and all_dyn_cost <= dyn_cost) {
-			const all_dyn_blk = try encoder().complete(alloc, try litTokens(alloc, raw), block.is_last, .{});
+			const all_dyn_blk = try p.encoder().complete(alloc, try litTokens(alloc, raw), block.is_last, .{});
 			break :blk .{ .block = all_dyn_blk, .raw = raw };
 		}
 		break :blk .{ .block = dyn_blk, .raw = raw };
@@ -3147,7 +3052,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 	var cur_best = best;
 	switch (result.block.body) {
 		.huff => |h| if (!h.is_fixed) {
-			if (try polishedOf(alloc, h)) |pol_huff| {
+			if (try polishedOf(p, alloc, h)) |pol_huff| {
 				const pol_cost = try dynBlockCost(pol_huff);
 				if (pol_cost < cur_best) {
 					result.block = .{ .is_last = block.is_last, .body = .{ .huff = pol_huff } };
@@ -3164,14 +3069,14 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 	// input-tree basin (where the legacy tools' joint fixpoints live).
 	switch (result.block.body) {
 		.huff => |h| if (!h.is_fixed) {
-			const jr = try jointDescent(alloc, h, orig_tokens, pc.matches, false);
+			const jr = try jointDescent(p, alloc, h, orig_tokens, pc.matches, false);
 			if (jr.cost < cur_best) {
 				result.block = .{ .is_last = block.is_last, .body = .{ .huff = jr.h } };
 				cur_best = jr.cost;
 			}
 			switch (block.body) {
 				.huff => |ih| if (!ih.is_fixed and ih.ll_lengths.len > 0 and raw.len <= JOINT_INPUT_SEED_MAX_RAW) {
-					const ibuilt = try buildCl(alloc, ih.ll_lengths, ih.dist_lengths);
+					const ibuilt = try p.encoder().header(alloc, ih.ll_lengths, ih.dist_lengths, .full);
 					const seed: Huff = .{
 						.is_fixed = false,
 						.tokens = ih.tokens,
@@ -3180,7 +3085,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 						.cl_lengths = ibuilt.cl_lengths,
 						.cl_entries = ibuilt.entries.items,
 					};
-					const jr2 = try jointDescent(alloc, seed, orig_tokens, pc.matches, true);
+					const jr2 = try jointDescent(p, alloc, seed, orig_tokens, pc.matches, true);
 					if (jr2.cost < cur_best) {
 						result.block = .{ .is_last = block.is_last, .body = .{ .huff = jr2.h } };
 						cur_best = jr2.cost;
@@ -3198,7 +3103,7 @@ fn optimizeBlockCfg(alloc: std.mem.Allocator, block: Block, pc: Precomp) !OptRes
 	// whose stream is a fixpoint (so the descent broke before a candidate).
 	switch (result.block.body) {
 		.huff => |h| if (!h.is_fixed) {
-			if (try crossingOf(alloc, h)) |cb| {
+			if (try crossingOf(p, alloc, h)) |cb| {
 				const cc = try dynBlockCost(cb);
 				if (cc < cur_best) {
 					result.block = .{ .is_last = block.is_last, .body = .{ .huff = cb } };
@@ -3266,11 +3171,12 @@ fn sameCodebooks(a: Huff, b: Huff) bool {
 }
 
 test "codebook identity ignores header spelling but includes both alphabets" {
+	const p: Polisher = .{};
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
 	var tokens = [_]Token{ .{ .lit = 65 }, .{ .lit = 66 } };
-	const block = try encoder().complete(a, &tokens, true, .{});
+	const block = try p.encoder().complete(a, &tokens, true, .{});
 	const original = block.body.huff;
 	var padded = (try dupeBlock(a, block)).body.huff;
 	padded.ll_lengths = try a.alloc(u8, 286);
@@ -3279,7 +3185,7 @@ test "codebook identity ignores header spelling but includes both alphabets" {
 	@memset(padded.dist_lengths, 0);
 	@memcpy(padded.ll_lengths[0..original.ll_lengths.len], original.ll_lengths);
 	@memcpy(padded.dist_lengths[0..original.dist_lengths.len], original.dist_lengths);
-	const cl = try encoder().header(a, padded.ll_lengths, padded.dist_lengths, .greedy);
+	const cl = try p.encoder().header(a, padded.ll_lengths, padded.dist_lengths, .greedy);
 	padded.cl_entries = cl.entries.items;
 	padded.cl_lengths = cl.cl_lengths;
 	padded.encoding = .{ .hclen = 19 };
@@ -3320,8 +3226,8 @@ const HuffmanRun = struct {
 		std.debug.assert(self.blocks == 0 or sameCodebooks(self.header.body.huff, h));
 		var header = block;
 		header.body.huff.tokens = &.{};
-		const bits = try blockCost(header);
-		self.payload_bits += (try blockCost(block)) - bits;
+		const bits = try blockCost(0, header);
+		self.payload_bits += (try blockCost(0, block)) - bits;
 		if (self.blocks == 0 or bits < self.header_bits) {
 			_ = self.header_arena.reset(.free_all);
 			self.header = try dupeBlock(self.header_arena.allocator(), header);
@@ -3345,7 +3251,7 @@ const HuffmanRun = struct {
 		self.padding = if (h.encoding) |e| e.final_padding else null;
 	}
 
-	fn emit(self: *HuffmanRun, w: *common.BitWriter, cfg: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator) !bool {
+	fn emit(self: *HuffmanRun, options: Options, w: *common.BitWriter, cfg: *std.heap.ArenaAllocator, states: *[2]std.heap.ArenaAllocator) !bool {
 		if (self.blocks == 0) return false;
 		defer {
 			self.tokens.clearAndFree(std.heap.page_allocator);
@@ -3362,7 +3268,7 @@ const HuffmanRun = struct {
 		block.body.huff.encoding = spelling;
 		if (self.blocks > 1) {
 			self.joined = true;
-			block = (try optimizeBlockAtOffset(scratch.allocator(), cfg, states, block, self.prior[0..self.prior_len], @intCast(w.totalBits() & 7))).block;
+			block = (try optimizeBlock(options, scratch.allocator(), cfg, states, block, self.prior[0..self.prior_len], @intCast(w.totalBits() & 7))).block;
 		}
 		const emitted = try emitBlock(w, block, self.prior[0..self.prior_len]);
 		self.joined = self.joined or emitted.split;
@@ -3378,7 +3284,7 @@ fn emitBlock(w: *common.BitWriter, block: Block, prior: []const u8) !struct { sp
 	var last_header = w.out.items.len * 8 + w.cnt;
 	if (block.body == .huff) {
 		const size = try block.decodedLength();
-		if (size > 65535 and storedRegionCost(size, @intCast(last_header & 7)) < try blockCost(block)) {
+		if (size > 65535 and storedRegionCost(size, @intCast(last_header & 7)) < try blockCost(0, block)) {
 			var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 			defer arena.deinit();
 			const program = try ir.Program.decode(arena.allocator(), block, prior);
@@ -3398,46 +3304,46 @@ fn emitBlock(w: *common.BitWriter, block: Block, prior: []const u8) !struct { sp
 
 /// Settle boundaries and tree/token polishing before discovering new matches
 /// in changed blocks. Repeat when reparsing makes further boundary work useful.
-fn optimizeDeflateFusedConsumed(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize) deflasm.ParseError!void {
+fn optimizeDeflateFusedConsumed(options: Options, a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize) deflasm.ParseError!void {
 	const start = out.items.len;
-	try fusedPasses(a, out, in, consumed_bytes, null);
-	if (!boundary_search_enabled) return;
+	try fusedPasses(options, a, out, in, consumed_bytes, null);
+	if (!options.boundary_search) return;
 	// Strict byte descent bounds the rounds; a cap would leave work for a second call.
 	while (true) {
 		var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 		defer scratch.deinit();
 		var candidate: std.ArrayList(u8) = .empty;
 		defer candidate.deinit(std.heap.page_allocator);
-		if (!try boundaryPolish(&candidate, out.items[start..])) break;
+		if (!try boundaryPolish(options, &candidate, out.items[start..])) break;
 		var polished: std.ArrayList(u8) = .empty;
 		defer polished.deinit(std.heap.page_allocator);
-		if (reparse_enabled) {
+		if (options.reparse) {
 			const fresh = try changedBlocks(scratch.allocator(), out.items[start..], candidate.items);
 			var consumed: usize = undefined;
-			try fusedPasses(std.heap.page_allocator, &polished, candidate.items, &consumed, fresh);
+			try fusedPasses(options, std.heap.page_allocator, &polished, candidate.items, &consumed, fresh);
 			std.debug.assert(consumed == candidate.items.len);
 		} else std.mem.swap(std.ArrayList(u8), &polished, &candidate);
 		if (polished.items.len >= out.items.len - start) break;
 		out.shrinkRetainingCapacity(start);
 		try out.appendSlice(a, polished.items);
-		if (!reparse_enabled) break; // The boundary/polish loop already settled this encoding.
+		if (!options.reparse) break; // The boundary/polish loop already settled this encoding.
 	}
 }
 
 /// Keep match discovery outside the boundary/polish loop. The first candidate
 /// may save only bits; reparsing still gets a chance to turn that into bytes.
-fn boundaryPolish(out: *std.ArrayList(u8), stream: []const u8) deflasm.ParseError!bool {
-	const previous = swapReparse(false);
-	defer _ = swapReparse(previous);
+fn boundaryPolish(options: Options, out: *std.ArrayList(u8), stream: []const u8) deflasm.ParseError!bool {
+	var polish_options = options;
+	polish_options.reparse = false;
 	var current = stream;
 	while (true) {
 		var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 		defer scratch.deinit();
-		const candidate = (try boundaryRound(scratch.allocator(), current)) orelse break;
+		const candidate = (try boundaryRound(options, scratch.allocator(), current)) orelse break;
 		var polished: std.ArrayList(u8) = .empty;
 		defer polished.deinit(std.heap.page_allocator);
 		var consumed: usize = undefined;
-		try fusedPasses(std.heap.page_allocator, &polished, candidate.bytes, &consumed, candidate.fresh);
+		try fusedPasses(polish_options, std.heap.page_allocator, &polished, candidate.bytes, &consumed, candidate.fresh);
 		std.debug.assert(consumed == candidate.bytes.len);
 		const shrank = polished.items.len < current.len;
 		if (out.items.len != 0 and !shrank) break;
@@ -3475,7 +3381,7 @@ const BoundaryCandidate = struct { bytes: []u8, fresh: []const bool };
 
 /// Batch boundary searches and tree refits. Only the encoding and change mask
 /// survive; decoded bytes and DP storage are released before token polishing.
-fn boundaryRound(a: std.mem.Allocator, stream: []const u8) deflasm.ParseError!?BoundaryCandidate {
+fn boundaryRound(options: Options, a: std.mem.Allocator, stream: []const u8) deflasm.ParseError!?BoundaryCandidate {
 	var iteration_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 	defer iteration_arena.deinit();
 	const ia = iteration_arena.allocator();
@@ -3495,25 +3401,25 @@ fn boundaryRound(a: std.mem.Allocator, stream: []const u8) deflasm.ParseError!?B
 		const overheads = try ia.alloc(u32, blocks.len);
 		var input_bits: u64 = 0;
 		for (blocks, 0..) |b, i| {
-			costs[i] = @intCast(try blockCost(b));
+			costs[i] = @intCast(try blockCost(0, b));
 			input_bits += costs[i];
 			overheads[i] = 0;
 			if (b.body == .huff) {
 				var header = b;
 				header.body.huff.tokens = &.{};
-				overheads[i] = @intCast(try blockCost(header));
+				overheads[i] = @intCast(try blockCost(0, header));
 			}
 		}
-		const found = (try boundary.search(ia, blocks, costs, overheads, dec, edges, .{ .slack = boundary_slack })) orelse break;
+		const found = (try boundary.search(ia, blocks, costs, overheads, dec, edges, .{ .slack = options.boundary_slack })) orelse break;
 		var total: u64 = 0;
-		for (found.blocks) |b| total += @intCast(try blockCost(b));
+		for (found.blocks) |b| total += @intCast(try blockCost(0, b));
 		if (total != input_bits - found.before + found.after) @panic("boundary search price differs from assembly");
 		for (found.blocks, found.fresh) |*b, f| {
 			if (!f or b.body != .huff) continue;
-			var refit = try encoder().complete(ia, b.body.huff.tokens, b.is_last, .{});
-			if (min_dist_codes > 0) refit = try repairDistFloor(ia, refit, min_dist_codes);
-			const refit_bits = try blockCost(refit);
-			if (refit_bits < try blockCost(b.*)) {
+			const refit = try options.encoder().complete(ia, b.body.huff.tokens, b.is_last, .{});
+			std.debug.assert(countNonzero(refit.body.huff.dist_lengths) >= options.min_dist_codes);
+			const refit_bits = try blockCost(0, refit);
+			if (refit_bits < try blockCost(0, b.*)) {
 				b.* = refit;
 			}
 		}
@@ -3539,7 +3445,7 @@ fn sameBlock(x: Block, y: Block) bool {
 	const p = x.body.huff;
 	const q = y.body.huff;
 	if (!sameCodebooks(p, q) or !tokensEqual(p.tokens, q.tokens)) return false;
-	return (blockCost(x) catch return false) == (blockCost(y) catch return false);
+	return (blockCost(0, x) catch return false) == (blockCost(0, y) catch return false);
 }
 
 /// A Huffman block that was a per-block fixed point at one offset stays one at
@@ -3548,7 +3454,7 @@ fn sameBlock(x: Block, y: Block) bool {
 fn storedWinsAtOffset(block: Block, offset: u3) !bool {
 	if (block.body != .huff) return true;
 	const size = try block.decodedLength();
-	return storedRegionCost(size, offset) < try blockCost(block);
+	return storedRegionCost(size, offset) < try blockCost(0, block);
 }
 
 /// Streaming loop with one reader and one writer.
@@ -3561,9 +3467,9 @@ fn storedWinsAtOffset(block: Block, offset: u3) !bool {
 /// emitted header. An entirely empty stream retains one optimized final block.
 /// Reports consumed bytes (the final block's last bit rounded up), so callers
 /// can walk concatenated streams without a separate probe parse.
-fn fusedPasses(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, fresh: ?[]const bool) deflasm.ParseError!void {
+fn fusedPasses(options: Options, a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, fresh: ?[]const bool) deflasm.ParseError!void {
 	const start = out.items.len;
-	var joined = try optimizeDeflatePass(a, out, in, consumed_bytes, true, fresh);
+	var joined = try optimizeDeflatePass(options, a, out, in, consumed_bytes, true, fresh);
 	var previous: std.ArrayList(u8) = .empty;
 	defer previous.deinit(std.heap.page_allocator);
 	// Joining can change later offsets; raw lowering creates new boundaries.
@@ -3576,7 +3482,7 @@ fn fusedPasses(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, co
 		try previous.appendSlice(std.heap.page_allocator, out.items[start..]);
 		out.shrinkRetainingCapacity(start);
 		var consumed: usize = undefined;
-		joined = try optimizeDeflatePass(a, out, previous.items, &consumed, false, null);
+		joined = try optimizeDeflatePass(options, a, out, previous.items, &consumed, false, null);
 		if (std.mem.eql(u8, previous.items, out.items[start..])) break;
 	}
 }
@@ -3584,7 +3490,7 @@ fn fusedPasses(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, co
 /// `fresh` (first pass only) marks blocks that need the per-block search;
 /// the others are known fixed points and get it only where stored would win
 /// at their new offset.
-fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, first_pass: bool, fresh: ?[]const bool) deflasm.ParseError!bool {
+fn optimizeDeflatePass(options: Options, a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, consumed_bytes: *usize, first_pass: bool, fresh: ?[]const bool) deflasm.ParseError!bool {
 	var r = common.BitReader{ .data = in };
 	var w = common.BitWriter.init(out, a);
 	// Keep only the last 32768 decoded bytes as context for the next block.
@@ -3625,7 +3531,7 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 			if (run.blocks != 0) {
 				run.is_last = true;
 				run.padding = null;
-				_ = try run.emit(&w, &cfg_scratch, &states);
+				_ = try run.emit(options, &w, &cfg_scratch, &states);
 				break;
 			}
 			if (last_header) |bit| {
@@ -3641,12 +3547,12 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 		// starting offset changed. Stored blocks may be newly lowered chunks.
 		const search_it = if (fresh) |f| (index >= f.len or f[index] or b.body == .stored or try storedWinsAtOffset(b, offset)) else (first_pass or b.body == .stored or offset != source_offset);
 		var res: OptResult = if (search_it)
-			try optimizeBlockAtOffset(scratch.allocator(), &cfg_scratch, &states, b, window[0..wlen], offset)
+			try optimizeBlock(options, scratch.allocator(), &cfg_scratch, &states, b, window[0..wlen], offset)
 		else .{ .block = b, .raw = (try ir.Program.decode(scratch.allocator(), b, window[0..wlen])).raw() };
 		if (run.blocks != 0 and (res.block.body != .huff or !sameCodebooks(run.header.body.huff, res.block.body.huff))) {
-			_ = try run.emit(&w, &cfg_scratch, &states);
+			_ = try run.emit(options, &w, &cfg_scratch, &states);
 			const actual: u3 = @intCast(w.totalBits() & 7);
-			if (actual != offset) res = try optimizeBlockAtOffset(scratch.allocator(), &cfg_scratch, &states, b, window[0..wlen], actual);
+			if (actual != offset) res = try optimizeBlock(options, scratch.allocator(), &cfg_scratch, &states, b, window[0..wlen], actual);
 		}
 		if (res.block.body == .huff and (!b.is_last or run.blocks != 0)) {
 			try run.append(res.block, window[0..wlen]);
@@ -3667,7 +3573,7 @@ fn optimizeDeflatePass(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []cons
 			wlen = keep + res.raw.len;
 		}
 		if (b.is_last) {
-			if (!try run.emit(&w, &cfg_scratch, &states)) {
+			if (!try run.emit(options, &w, &cfg_scratch, &states)) {
 				try deflasm.finishDeflate(&w, res.block);
 			}
 			break;
@@ -3716,7 +3622,7 @@ test "preserved encoding costs and deep copies agree with assembly" {
 		var w = common.BitWriter.init(&bits_buf, a);
 		try deflasm.assembleBlock(&w, b);
 		const cost: i64 = switch (b.body) {
-			.stored => |raw| storedCost(raw),
+			.stored => |raw| storedCost(0, raw),
 			.huff => |h| if (h.is_fixed) fixedCost(h.tokens, h.encoding != null) else try dynBlockCost(h),
 		};
 		try std.testing.expectEqual(cost, @as(i64, @intCast(w.totalBits())));
@@ -3728,6 +3634,7 @@ test "preserved encoding costs and deep copies agree with assembly" {
 }
 
 test "native encoding metadata survives valid edits and falls back after incompatible edits" {
+	const p: Polisher = .{};
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
@@ -3751,7 +3658,7 @@ test "native encoding metadata survives valid edits and falls back after incompa
 	// A new tree with no 284 invalidates the old preference even when the
 	// parsed context is deliberately retained; cost and output must agree.
 	changed_tokens[1].match.length = common.MAX_MATCH_LENGTH;
-	var rebuilt = try encoder().complete(a, b.body.huff.tokens, true, .{});
+	var rebuilt = try p.encoder().complete(a, b.body.huff.tokens, true, .{});
 	rebuilt.body.huff.encoding = b.body.huff.encoding;
 	try std.testing.expectEqual(@as(u8, 0), rebuilt.body.huff.ll_lengths[284]);
 	var w = common.BitWriter.init(&out, a);
@@ -3788,36 +3695,26 @@ test "native encoding metadata survives valid edits and falls back after incompa
 	try std.testing.expectEqualSlices(u8, changed, out.items);
 }
 
-/// Options are scoped to this call, including nested research calls.
+/// Search policy and optional caller-owned work storage. Neither is global.
 pub const Options = struct {
 	reparse: bool = true,
 	boundary_search: bool = false,
 	boundary_slack: u32 = (boundary.Options{}).slack,
+	/// Minimum codewords in rebuilt distance trees: 0, 1 or 2.
+	/// Inherited trees remain eligible; the floor affects search costs too.
 	min_dist_codes: u8 = 2,
 	explore_read: ExploreRead = .{},
 	feedback_policy: FeedbackPolicy = .{},
 	feedback_session: ?*FeedbackSession = null,
 	memo: ?*OptimizerMemo = null,
+	/// Accumulate across calls when supplied; otherwise counters are discarded.
+	stats: ?*ExploreStats = null,
+
+	pub fn encoder(options: Options) encoding.Builder {
+		std.debug.assert(options.min_dist_codes <= 2);
+		return (Polisher{ .floor = options.min_dist_codes, .memo = options.memo }).encoder();
+	}
 };
-
-/// Snapshot the legacy research scope for callers migrating from swap* APIs.
-pub fn currentOptions() Options {
-	return .{ .reparse = reparse_enabled, .boundary_search = boundary_search_enabled, .boundary_slack = boundary_slack, .min_dist_codes = min_dist_codes,
-		.explore_read = explore_read, .feedback_policy = feedback_policy,
-		.feedback_session = feedback_session, .memo = active_optimizer_memo };
-}
-
-fn setOptions(options: Options) void {
-	std.debug.assert(options.min_dist_codes <= 2);
-	reparse_enabled = options.reparse;
-	boundary_search_enabled = options.boundary_search;
-	boundary_slack = options.boundary_slack;
-	min_dist_codes = options.min_dist_codes;
-	explore_read = options.explore_read;
-	feedback_policy = options.feedback_policy;
-	feedback_session = options.feedback_session;
-	active_optimizer_memo = options.memo;
-}
 
 pub const Checksum = enum { none, crc32, adler32 };
 pub const Result = struct {
@@ -3834,13 +3731,11 @@ pub const StreamError = deflasm.ParseError || error{VerificationFailed};
 /// Only encoded output lives in `a`; parse/search scratch is recycled per block
 /// and verification uses fixed-size windows. No container or file-size policy.
 pub fn optimize(a: std.mem.Allocator, out: *std.ArrayList(u8), in: []const u8, options: Options, checksum: Checksum) StreamError!Result {
-	const previous = currentOptions();
-	setOptions(options);
-	defer setOptions(previous);
+	std.debug.assert(options.min_dist_codes <= 2);
 	const start = out.items.len;
 	errdefer out.shrinkRetainingCapacity(start);
 	var consumed: usize = undefined;
-	try optimizeDeflateFusedConsumed(a, out, in, &consumed);
+	try optimizeDeflateFusedConsumed(options, a, out, in, &consumed);
 	std.debug.assert(consumed <= in.len);
 	return verify(in[0..consumed], out.items[start..], checksum);
 }
@@ -3900,9 +3795,9 @@ fn verify(orig: []const u8, opt: ?[]const u8, checksum: Checksum) StreamError!Re
 		.checksum = switch (checksum) { .none => 0, .crc32 => crc.final(), .adler32 => adler.adler } };
 }
 
-fn optimizeDeflateBytes(a: std.mem.Allocator, in: []const u8) StreamError![]u8 {
+fn optimizeDeflateBytes(options: Options, a: std.mem.Allocator, in: []const u8) StreamError![]u8 {
 	var out: std.ArrayList(u8) = .empty;
-	_ = try optimize(a, &out, in, currentOptions(), .none);
+	_ = try optimize(a, &out, in, options, .none);
 	return out.items;
 }
 
@@ -3911,12 +3806,11 @@ fn inflateEql(orig: []const u8, opt: []const u8) bool {
 	return true;
 }
 
-test "stream interface owns extent, integrity, rollback and option scope" {
+test "stream interface owns extent, integrity, rollback and independent options" {
 	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 	defer arena.deinit();
 	const a = arena.allocator();
 	const input = [_]u8{ 1, 3, 0, 0xfc, 0xff, 'a', 'b', 'c', 0xde, 0xad };
-	const previous = currentOptions();
 	for ([_]bool{ true, false }) |reparse_on| {
 		for (0..3) |floor| {
 			for ([_]Checksum{ .none, .crc32, .adler32 }) |checksum| {
@@ -3931,7 +3825,7 @@ test "stream interface owns extent, integrity, rollback and option scope" {
 					.none => 0, .crc32 => std.hash.crc.Crc32.hash("abc"), .adler32 => 0x024d0127,
 				}), result.checksum);
 				try std.testing.expectEqualSlices(u8, "prefix", out.items[0..6]);
-				try std.testing.expectEqualDeep(previous, currentOptions());
+
 			}
 		}
 	}
@@ -3940,7 +3834,7 @@ test "stream interface owns extent, integrity, rollback and option scope" {
 	const malformed = [_]u8{ 0, 1, 0, 0xfe, 0xff, 'a', 7 };
 	try std.testing.expectError(error.Malformed, optimize(a, &out, &malformed, .{ .reparse = false, .min_dist_codes = 0 }, .none));
 	try std.testing.expectEqualSlices(u8, "prefix", out.items);
-	try std.testing.expectEqualDeep(previous, currentOptions());
+
 	try std.testing.expectEqual(8, try roundtrip(a, &out, &input));
 	try std.testing.expectEqualSlices(u8, input[0..8], out.items[6..]);
 	const info = try inspect(a, &input, .crc32);
@@ -3953,4 +3847,26 @@ test "stream verifier refuses changed output" {
 	const good = [_]u8{ 1, 3, 0, 0xfc, 0xff, 'a', 'b', 'c' };
 	const changed = [_]u8{ 1, 3, 0, 0xfc, 0xff, 'a', 'b', 'd' };
 	try std.testing.expectError(error.VerificationFailed, verify(&good, &changed, .crc32));
+}
+
+test "projection memo preserves results when a caller changes the distance floor" {
+	var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	var memo = try OptimizerMemo.init(a, 16);
+	defer memo.deinit();
+	var sub = std.heap.ArenaAllocator.init(a);
+	defer sub.deinit();
+	var states = [_]std.heap.ArenaAllocator{ std.heap.ArenaAllocator.init(a), std.heap.ArenaAllocator.init(a) };
+	defer for (&states) |*state| state.deinit();
+	var tokens: [52]Token = undefined;
+	for (tokens[0..48], 0..) |*t, i| t.* = .{ .lit = @intCast(0x40 + i % 16) };
+	for (tokens[48..]) |*t| t.* = .{ .match = .{ .length = 3, .distance = 5 } };
+	const block = try (Options{}).encoder().complete(a, &tokens, true, .{});
+	const program = try ir.Program.decode(a, block, &.{});
+	for ([_]u8{ 2, 0, 1, 2 }) |floor| {
+		const cold = try optimizeBlockAt(.{ .min_dist_codes = floor }, a, &sub, &states, block, program, 0);
+		const warm = try optimizeBlockAt(.{ .min_dist_codes = floor, .memo = &memo }, a, &sub, &states, block, program, 0);
+		try std.testing.expectEqualStrings(try blockBytes(a, cold.block), try blockBytes(a, warm.block));
+	}
 }
